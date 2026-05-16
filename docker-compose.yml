@@ -1,0 +1,105 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Memora — docker-compose stack
+#
+# Services
+#   redis    — Celery broker + result backend
+#   backend  — FastAPI API server (port 8000, internal only)
+#   worker   — Celery worker (same image, different CMD)
+#   frontend — Nginx serving the React SPA + proxying /api/* to backend
+#
+# First-time setup
+#   cp backend/.env.example backend/.env   # then fill in secrets
+#   docker compose up --build
+#
+# The app is available at http://localhost:3000
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── Redis ──────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # Port not exposed to the host — only backend/worker need it internally
+
+  # ── FastAPI backend ────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file: backend/.env
+    environment:
+      # Override the default SQLite path so it lands inside the persistent volume
+      DATABASE_URL: sqlite:////app/data/db/memora.db
+      UPLOAD_DIR: /app/data/uploads
+      JOBS_DIR:   /app/data/jobs
+      REDIS_URL:  redis://redis:6379/0
+      CORS_ORIGINS: '["http://localhost:5173","http://localhost:3000","http://localhost:80"]'
+    volumes:
+      - app_data:/app/data
+    ports:
+      - "8000:8000"          # exposed for direct API access / local dev debugging
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      start_period: 10s
+      retries: 5
+
+  # ── Celery worker ──────────────────────────────────────────────────────────
+  worker:
+    build:
+      context: backend
+      dockerfile: Dockerfile
+    command: >
+      celery -A tasks.celery_app worker
+        --loglevel=info
+        --concurrency=2
+        --queues=celery
+    restart: unless-stopped
+    env_file: backend/.env
+    environment:
+      DATABASE_URL: sqlite:////app/data/db/memora.db
+      UPLOAD_DIR: /app/data/uploads
+      JOBS_DIR:   /app/data/jobs
+      REDIS_URL:  redis://redis:6379/0
+      PYTHONPATH: /app
+      CORS_ORIGINS: '["http://localhost:5173","http://localhost:3000","http://localhost:80"]'
+    volumes:
+      - app_data:/app/data
+    depends_on:
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_healthy   # ensures DB is initialised before worker starts
+
+  # ── Frontend (nginx + React SPA) ───────────────────────────────────────────
+  frontend:
+    build:
+      context: frontend
+      dockerfile: Dockerfile
+      args:
+        # VITE_API_BASE_URL is intentionally blank — all /api/* calls are
+        # relative to the frontend origin and proxied by nginx to the backend.
+        VITE_API_BASE_URL: ""
+        VITE_API_KEY: ${ORG_API_KEY:-changeme}
+    restart: unless-stopped
+    ports:
+      - "3000:80"            # app available at http://localhost:3000
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  # Single named volume shared between backend + worker; subdirectories isolate
+  # uploads, jobs (transcripts / results), and the SQLite database.
+  app_data:

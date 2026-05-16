@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+
+# Data / model caches — these live in Docker named volumes, not the image
+uploads/
+jobs/
+*.db
+*.db-shm
+*.db-wal
+
+# Secrets — never bake into the image
+.env
+
+# Dev tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

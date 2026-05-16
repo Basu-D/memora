@@ -1,0 +1,33 @@
+# Web framework
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+python-multipart==0.0.12
+
+# Settings
+pydantic-settings==2.6.1
+
+# Task queue
+celery==5.4.0
+redis==5.2.0
+
+# Database
+sqlalchemy==2.0.36
+
+# AI — transcription (cloud API, no local model)
+openai>=1.52.0
+
+# AI — extraction
+google-generativeai==0.8.3
+
+# Confluence / HTTP
+httpx==0.27.2
+
+# Document generation
+python-docx==1.1.2
+
+# Utilities
+python-dotenv==1.0.1
+
+# URL download
+yt-dlp
+curl-cffi>=0.7.0
