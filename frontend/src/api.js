@@ -48,22 +48,56 @@ async function apiFetch(path, options = {}) {
 }
 
 // ---------------------------------------------------------------------------
+// Confluence destination helpers
+// ---------------------------------------------------------------------------
+
+/** @returns {Promise<{key: string, name: string}[]>} */
+export async function getConfluenceSpaces() {
+  const response = await apiFetch("/confluence/spaces");
+  return response.json();
+}
+
+/**
+ * @param {string} spaceKey
+ * @returns {Promise<{id: string, title: string}[]>}
+ */
+export async function getConfluencePages(spaceKey) {
+  const response = await apiFetch(`/confluence/pages?space_key=${encodeURIComponent(spaceKey)}`);
+  return response.json();
+}
+
+// ---------------------------------------------------------------------------
 // Upload
 // ---------------------------------------------------------------------------
 
 /**
  * Upload a meeting recording and queue processing.
  *
- * @param {File}   file   — Audio or video file (mp4 / mp3 / webm / wav / m4a).
- * @param {string} title  — Optional meeting title hint (sent as a form field).
+ * @param {File}   file
+ * @param {string} title
+ * @param {string} outputType
+ * @param {boolean} publishToConfluence
+ * @param {string} customInstructions
+ * @param {{space_key?:string, parent_page_id?:string, page_title?:string}} confluenceDest
+ * @param {string} contextText
+ * @param {string} contextReferenceUrl
  * @returns {Promise<{job_id: string, status: string}>}
  */
-export async function uploadMeeting(file, title = "", outputType = "detailed", publishToConfluence = true) {
+export async function uploadMeeting(
+  file, title = "", outputType = "detailed", publishToConfluence = true,
+  customInstructions = "", confluenceDest = {}, contextText = "", contextReferenceUrl = "",
+) {
   const formData = new FormData();
   formData.append("file", file);
   if (title.trim()) formData.append("title", title.trim());
   formData.append("output_type", outputType);
   formData.append("publish_to_confluence", String(publishToConfluence));
+  if (customInstructions.trim()) formData.append("custom_instructions", customInstructions.trim());
+  if (confluenceDest.space_key)       formData.append("confluence_space_key", confluenceDest.space_key);
+  if (confluenceDest.parent_page_id)  formData.append("confluence_parent_page_id", confluenceDest.parent_page_id);
+  if (confluenceDest.page_title)      formData.append("confluence_page_title", confluenceDest.page_title);
+  if (contextText.trim())             formData.append("context_text", contextText.trim());
+  if (contextReferenceUrl.trim())     formData.append("confluence_reference_url", contextReferenceUrl.trim());
 
   const response = await apiFetch("/upload", {
     method: "POST",
@@ -81,11 +115,20 @@ export async function uploadMeeting(file, title = "", outputType = "detailed", p
 /**
  * Submit a recording URL for processing (downloaded by the worker).
  *
- * @param {string} url    — Publicly accessible recording URL.
- * @param {string} title  — Optional meeting title hint.
+ * @param {string} url
+ * @param {string} title
+ * @param {string} outputType
+ * @param {boolean} publishToConfluence
+ * @param {string} customInstructions
+ * @param {{space_key?:string, parent_page_id?:string, page_title?:string}} confluenceDest
+ * @param {string} contextText
+ * @param {string} contextReferenceUrl
  * @returns {Promise<{job_id: string, status: string}>}
  */
-export async function submitUrlMeeting(url, title = "", outputType = "detailed", publishToConfluence = true) {
+export async function submitUrlMeeting(
+  url, title = "", outputType = "detailed", publishToConfluence = true,
+  customInstructions = "", confluenceDest = {}, contextText = "", contextReferenceUrl = "",
+) {
   const response = await apiFetch("/upload-url", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -94,6 +137,12 @@ export async function submitUrlMeeting(url, title = "", outputType = "detailed",
       title: title.trim(),
       output_type: outputType,
       publish_to_confluence: publishToConfluence,
+      custom_instructions: customInstructions.trim(),
+      confluence_space_key: confluenceDest.space_key || "",
+      confluence_parent_page_id: confluenceDest.parent_page_id || "",
+      confluence_page_title: confluenceDest.page_title || "",
+      context_text: contextText.trim(),
+      confluence_reference_url: contextReferenceUrl.trim(),
     }),
   });
   return response.json();

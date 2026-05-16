@@ -15,6 +15,7 @@ from celery import Celery
 from celery.utils.log import get_task_logger
 
 from config import settings
+from recording_downloader import get_downloader
 
 
 logger = get_task_logger(__name__)
@@ -71,6 +72,14 @@ def process_recording(self, job_id: str) -> None:
         source_url = job.source_url
         output_type = job.output_type or "detailed"
         publish_to_confluence = job.publish_to_confluence if job.publish_to_confluence is not None else True
+        custom_instructions = job.custom_instructions or ""
+        confluence_destination = {
+            "space_key":      job.confluence_space_key or "",
+            "parent_page_id": job.confluence_parent_page_id or "",
+            "page_title":     job.confluence_page_title or "",
+        }
+        context_text = job.context_text or ""
+        # screenshots_enabled = job.screenshots_enabled  # §4.4 TODO
     except ValueError as exc:
         logger.error("process_recording: job %s not found — %s", job_id, exc)
         db.close()
@@ -92,7 +101,8 @@ def process_recording(self, job_id: str) -> None:
             db.close()
 
         try:
-            upload_path = _download_from_url(source_url, job_id, Path(settings.upload_dir))
+            downloader = get_downloader()
+            upload_path = downloader.download(source_url, job_id, Path(settings.upload_dir))
             storage_path = upload_path.name
             logger.info("[%s] Download complete: %s", job_id, upload_path)
         except Exception as exc:
@@ -158,10 +168,22 @@ def process_recording(self, job_id: str) -> None:
     finally:
         db.close()
 
+    # Step 3b: Screenshot capture (screenshots_enabled) — §4.4 TODO
+    # if screenshots_enabled:
+    #     from screenshot_capture import capture_screenshots
+    #     capture_screenshots(job_id, upload_path, job_dir, transcript_data)
+
     # --------------------------------------------------------- Step 3: agent
     try:
         from agent import run_agent
-        run_agent(job_id, output_type=output_type, publish_to_confluence=publish_to_confluence)
+        run_agent(
+            job_id,
+            output_type=output_type,
+            publish_to_confluence=publish_to_confluence,
+            custom_instructions=custom_instructions,
+            confluence_destination=confluence_destination,
+            context_text=context_text,
+        )
         logger.info("[%s] Agent complete", job_id)
     except Exception as exc:
         logger.exception("[%s] Agent/publish step failed", job_id)
@@ -323,102 +345,6 @@ def _transcribe(audio_path: Path, job_dir: Path, job_id: str) -> Path:
         transcript["language"],
     )
     return transcript_path
-
-
-# ---------------------------------------------------------------------------
-# Step 0 helper — URL download via yt-dlp
-# ---------------------------------------------------------------------------
-
-MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
-
-
-def _download_from_url(url: str, job_id: str, upload_dir: Path) -> Path:
-    """
-    Download the recording at *url* into *upload_dir* using yt-dlp.
-
-    Handles direct file links (mp4, mp3, webm …) as well as platform
-    URLs that yt-dlp supports (YouTube, Vimeo, Zoom cloud recordings, etc.).
-
-    Returns:
-        Path to the downloaded file.
-
-    Raises:
-        RuntimeError: If yt-dlp cannot download the URL or the file is too large.
-    """
-    import yt_dlp
-
-    outtmpl = str(upload_dir / f"{job_id}.%(ext)s")
-
-    ydl_opts = {
-        "outtmpl": outtmpl,
-        # Prefer audio-only streams; fall back progressively to any available format.
-        "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best[ext=mp4]/best",
-        "max_filesize": MAX_DOWNLOAD_BYTES,
-        "socket_timeout": 30,   # abort if no data for 30 s — prevents infinite hangs
-        "retries": 3,
-        "quiet": True,
-        "no_warnings": False,
-        "noprogress": True,
-    }
-
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-    except yt_dlp.utils.DownloadError as exc:
-        raise RuntimeError(_friendly_download_error(str(exc))) from exc
-
-    # yt-dlp may merge streams and change the extension (e.g. webm→mp4).
-    # Use prepare_filename to get the actual path it wrote.
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        actual_filename = ydl.prepare_filename(info)
-    downloaded = Path(actual_filename)
-
-    # If the file isn't there, scan upload_dir for any file starting with job_id
-    # (handles post-processed extension changes like .webm.mp4).
-    if not downloaded.exists():
-        candidates = sorted(upload_dir.glob(f"{job_id}.*"))
-        if not candidates:
-            raise RuntimeError(
-                f"yt-dlp reported success but no file found for job {job_id} in {upload_dir}"
-            )
-        downloaded = candidates[0]
-
-    return downloaded
-
-
-def _friendly_download_error(raw: str) -> str:
-    """Convert a raw yt-dlp error string into a user-readable message."""
-    r = raw.lower()
-    if "sign in" in r or "confirm you're not a bot" in r or "cookies" in r:
-        return (
-            "YouTube blocked the download — it requires browser sign-in to verify you're human. "
-            "Please use a direct file URL (.mp4 / .mp3), a Vimeo link, or a Zoom/Google Drive "
-            "direct download link instead."
-        )
-    if "private video" in r or "video unavailable" in r or "this video is unavailable" in r:
-        return "The video is private or unavailable. Make sure the link is publicly accessible."
-    if "not available in your country" in r or "geo" in r:
-        return "This video is geo-restricted and cannot be downloaded from this server's location."
-    if "requested format is not available" in r:
-        return (
-            "No compatible audio/video format was found for this URL. "
-            "Try a direct file link (.mp4 / .mp3) instead."
-        )
-    if "extractor error" in r or "keyerror" in r or "please report this issue" in r:
-        return (
-            "The downloader hit a bug with this platform's URL. "
-            "Try a direct file link (.mp4 / .mp3) instead, or paste the direct download URL "
-            "from Zoom/Google Drive rather than the share page link."
-        )
-    if "unable to download" in r or "http error" in r or "connection" in r:
-        return "Could not reach the URL. Make sure it is publicly accessible and try again."
-    if "no such file" in r or "permission denied" in r:
-        return "Server could not save the downloaded file. Check storage permissions."
-    # Fall back to the original but strip the yt-dlp prefix noise
-    cleaned = raw
-    for prefix in ("ERROR: ", "[youtube] ", "[generic] "):
-        cleaned = cleaned.replace(prefix, "")
-    return f"Download failed: {cleaned.strip()}"
 
 
 # ---------------------------------------------------------------------------

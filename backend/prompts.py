@@ -143,19 +143,26 @@ Rules:
 """
 
 
-def build_extraction_prompt(transcript: str, output_type: str = "detailed", custom_instructions: str = "") -> str:
+def build_extraction_prompt(
+    transcript: str,
+    output_type: str = "detailed",
+    custom_instructions: str = "",
+    context_text: str = "",
+) -> str:
     """Return the correct extraction prompt for the given output type."""
-    instruction_block = ""
+    prefix_block = ""
+    if context_text.strip():
+        prefix_block += f"Meeting context provided by the user:\n{context_text.strip()}\n\n"
     if custom_instructions.strip():
-        instruction_block = f"Additional instructions from the user:\n{custom_instructions.strip()}\n\n"
+        prefix_block += f"Additional instructions from the user:\n{custom_instructions.strip()}\n\n"
 
     template_map = {
-        "mom":          _MOM_EXTRACTION_PROMPT,
+        "mom":           _MOM_EXTRACTION_PROMPT,
         "quick_summary": _QUICK_SUMMARY_EXTRACTION_PROMPT,
-        "action_items": _ACTION_ITEMS_EXTRACTION_PROMPT,
+        "action_items":  _ACTION_ITEMS_EXTRACTION_PROMPT,
     }
     template = template_map.get(output_type, EXTRACTION_PROMPT)
-    return template.format(transcript=transcript, custom_instructions=instruction_block)
+    return template.format(transcript=transcript, custom_instructions=prefix_block)
 
 
 # ---------------------------------------------------------------------------
@@ -169,14 +176,17 @@ You are publishing meeting notes to Confluence.  Follow these steps in order:
    check whether a page about this meeting already exists.
 
 2. Based on the search results:
-   - If a very similar page is found → call update_confluence_page with its ID.
-   - Otherwise → call create_confluence_page in space "{space_key}".
+   - If a very similar page already exists → call update_confluence_page with its ID.
+   - Otherwise → call create_confluence_page using EXACTLY these destination values:
+       space_key : "{space_key}"
+       parent_id : "{parent_page_id}"   (empty string = create at the space root)
    Use the page body provided below exactly as-is.
 
 3. Call flag_incomplete_action_items with the action items listed below.
 
-Meeting title : {title}
-Space key     : {space_key}
+Meeting title  : {title}
+Space          : {space_key}
+Parent page ID : {parent_page_id_display}
 
 --- PAGE BODY (Confluence Storage Format) ---
 {body}
@@ -192,11 +202,14 @@ def build_action_prompt(
     space_key: str,
     body: str,
     action_items_json: str,
+    parent_page_id: str = "",
 ) -> str:
     """Return the Phase 2 Confluence publish prompt."""
     return ACTION_PROMPT.format(
         title=title,
         space_key=space_key,
+        parent_page_id=parent_page_id or "",
+        parent_page_id_display=parent_page_id if parent_page_id else "(space root)",
         body=body,
         action_items_json=action_items_json,
     )

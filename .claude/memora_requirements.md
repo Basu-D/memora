@@ -1,6 +1,6 @@
 # Memora — Full Requirements Summary for Claude Code
 > Hand this document to Claude Code at the start of every session.
-> Last updated: May 2026
+> Last updated: May 2026 (rev 2 — Confluence destination + recording auth added)
 
 ---
 
@@ -34,6 +34,8 @@ The following is already built and working. Do NOT rewrite or remove these.
 - "Download .docx" button and "Open in Confluence" button
 - "New recording" back navigation
 - Footer note: "Audio is transcribed locally — your recording never leaves your infrastructure."
+  NOTE: This footer text is now inaccurate — Whisper is API-based (OpenAI cloud).
+  Update footer to: "Your recording is processed securely and never stored beyond your session."
 
 ### Backend (Python + FastAPI + Celery + Redis)
 - POST /upload — file upload endpoint
@@ -184,6 +186,242 @@ these moments and capture screenshots from the video to embed in the document.
 
 ---
 
+### 4.5 Confluence Destination — User Controls Where to Publish (HIGH PRIORITY — build now)
+
+**Problem with current behaviour:**
+The Gemini agent currently decides which Confluence space and parent page to
+publish under. This is wrong — the agent has no knowledge of the org's
+Confluence structure, team hierarchy, or naming conventions. The user must
+own this decision.
+
+**New behaviour:**
+When "Create Confluence page" is checked on the upload screen, show a
+**Confluence destination section** with three fields:
+
+```
+Space:        [ dropdown — shows display names, uses keys internally ]
+Parent page:  [ searchable dropdown — scoped to selected space ]
+Page title:   [ text input — pre-filled from meeting title, user can edit ]
+```
+
+---
+
+#### Display names — users never see space keys
+
+The Confluence API returns both key and display name: `{key: "ENG", name: "Engineering Team"}`.
+Always show the display name in the UI. Store and submit the key internally.
+Users should never see a space key or page ID anywhere in the interface.
+Same for parent pages — show the page title, use the page ID internally.
+
+---
+
+#### Frontend implementation
+
+**On mount:**
+1. Call `GET /confluence/spaces` to fetch available spaces.
+2. Read `memora_preferences` from localStorage (see Preferences section below).
+3. Pre-select the last used space if one exists in preferences.
+4. Show a loading spinner while fetching. On failure show:
+   "Could not load Confluence spaces — check settings" with a retry button.
+
+**Space selection:**
+- Dropdown shows display names only (e.g. "Engineering Team", "Platform Team")
+- When user selects a space, call `GET /confluence/pages?space_key=XYZ`
+- Pre-select the last used parent page for that space (from preferences)
+- If space changes, reset parent page to that space's last used page or blank
+
+**Parent page — searchable select (not a plain dropdown):**
+Structure the parent page field as a searchable select with two sections:
+
+```
+Parent page
+┌─────────────────────────────────┐
+│ 🔍 Search pages...              │
+├─────────────────────────────────┤
+│ Recently used                   │
+│   📄 2026 Meeting Notes         │  ← last used for this space
+│   📄 Sprint Reviews             │
+├─────────────────────────────────┤
+│ All pages                       │
+│   📄 Architecture Decisions     │
+│   📄 Onboarding Docs            │
+│   ...                           │
+└─────────────────────────────────┘
+```
+
+- "Recently used" section shows up to 5 pages previously selected for this space
+- "All pages" section shows all pages fetched from Confluence for this space
+- Search filters both sections live as user types
+- Parent page is optional — if left blank, page is created at space root
+
+**Page title:**
+- Pre-filled from the meeting title input field
+- User can override it freely
+
+**On successful job submission:**
+- Save selected space, parent page, output type, and "create confluence page"
+  preference to localStorage under key `memora_preferences`
+
+---
+
+#### localStorage Preferences Schema
+
+Key: `memora_preferences`
+
+```json
+{
+  "confluence": {
+    "last_space": { "key": "ENG", "name": "Engineering Team" },
+    "last_parent_page": { "id": "98765", "title": "2026 Meeting Notes" },
+    "create_page_default": true,
+    "recent_spaces": [
+      { "key": "ENG", "name": "Engineering Team" },
+      { "key": "PLAT", "name": "Platform Team" }
+    ],
+    "recent_parent_pages": {
+      "ENG": [
+        { "id": "98765", "title": "2026 Meeting Notes" },
+        { "id": "88123", "title": "Sprint Reviews" }
+      ],
+      "PLAT": [
+        { "id": "77001", "title": "Platform Standups" }
+      ]
+    }
+  },
+  "output_type": "detailed"
+}
+```
+
+Rules:
+- Max 5 entries per `recent_spaces` and per space in `recent_parent_pages`
+- Add new entry at top, remove oldest if limit exceeded
+- Update only on successful job submission, not on every dropdown change
+- `recent_parent_pages` is keyed by space key so each space has its own history
+- Each user's browser stores their own preferences independently
+- When user accounts are added later, this moves to a server-side user
+  preferences table — localStorage is the correct solution for now
+
+**Pre-selection on every subsequent visit:**
+- Space: pre-select `last_space`
+- Parent page: pre-select `last_parent_page` for the pre-selected space
+- "Create Confluence page" checkbox: reflect `create_page_default`
+- Output type dropdown: reflect `output_type`
+
+---
+
+#### Backend implementation
+
+Add two new endpoints:
+- `GET /confluence/spaces` — calls Confluence API, returns:
+  `[{"key": "ENG", "name": "Engineering Team"}, ...]`
+- `GET /confluence/pages?space_key=XYZ` — calls Confluence API, returns:
+  `[{"id": "98765", "title": "2026 Meeting Notes"}, ...]`
+
+Update the Job model to store:
+- `confluence_space_key` (string, nullable)
+- `confluence_parent_page_id` (string, nullable)
+- `confluence_page_title` (string, nullable)
+
+Update job submission endpoints (POST /upload and POST /process-url)
+to accept a `confluence_destination` object:
+```json
+{
+  "space_key": "ENG",
+  "parent_page_id": "98765",
+  "page_title": "Sprint 42 Review — 2026-05-16"
+}
+```
+
+---
+
+#### Agent behaviour change
+
+The Gemini agent NO LONGER decides where to publish. It receives
+`confluence_destination` from the job and uses it directly.
+
+The agent still:
+- Checks if a page with the same title already exists under that parent
+- Decides whether to create new or update existing
+- Builds the page content
+
+Remove placement logic from `search_confluence` tool. Keep duplicate detection only.
+
+---
+
+#### Remove `CONFLUENCE_SPACE_KEY` from .env
+
+No longer needed — users pick the space themselves.
+Remove from `.env.example` and all code references.
+Keep `CONFLUENCE_URL` and `CONFLUENCE_TOKEN` — those remain server config.
+
+---
+
+### 4.6 Recording URL Authentication — Configurable Strategy (DESIGN NOW, WIRE LATER)
+
+**Problem:**
+When Memora moves to org-wide use, Webex recording URLs will require
+authentication. The current implementation makes unauthenticated HTTP
+requests to download recordings from URLs. This will fail for internal
+Webex recordings.
+
+**Design: Strategy pattern via `RECORDING_AUTH_MODE` env variable**
+
+Add a `recording_downloader.py` module with an abstract base class
+and three implementations:
+
+```python
+class RecordingDownloader(ABC):
+    @abstractmethod
+    async def download(self, url: str, destination_path: str) -> None: ...
+
+class PublicDownloader(RecordingDownloader):
+    """No auth — works for public URLs, YouTube, Vimeo, direct links."""
+    ...
+
+class TokenDownloader(RecordingDownloader):
+    """Static Bearer token — works for org service account Webex access."""
+    # Uses WEBEX_SERVICE_TOKEN env var
+    ...
+
+class OAuthDownloader(RecordingDownloader):
+    """User-level OAuth — full Webex integration, user's own token."""
+    # TODO — implement when Webex OAuth flow is added
+    ...
+```
+
+**Factory function:**
+```python
+def get_downloader() -> RecordingDownloader:
+    mode = os.getenv("RECORDING_AUTH_MODE", "none")
+    if mode == "token":
+        return TokenDownloader()
+    elif mode == "oauth":
+        return OAuthDownloader()
+    else:
+        return PublicDownloader()
+```
+
+**Environment variables to add to .env.example:**
+```
+RECORDING_AUTH_MODE=none         # none | token | oauth
+WEBEX_SERVICE_TOKEN=             # only required if RECORDING_AUTH_MODE=token
+```
+
+**Current state (build now):**
+- Create `recording_downloader.py` with the ABC and `PublicDownloader` fully implemented
+- Create `TokenDownloader` stubbed with a TODO comment
+- Create `OAuthDownloader` stubbed with a TODO comment
+- Update `tasks.py` to use `get_downloader()` instead of direct HTTP calls
+- Add `RECORDING_AUTH_MODE` and `WEBEX_SERVICE_TOKEN` to `.env.example`
+  with comments explaining each mode
+
+**When moving to org (future):**
+- Set `RECORDING_AUTH_MODE=token` in environment
+- Set `WEBEX_SERVICE_TOKEN` to the org service account token
+- No code changes required — just env var update
+
+---
+
 ## 5. Deployment Requirements
 
 ### Target Platform: Railway (Hobby — $5/month)
@@ -207,7 +445,6 @@ OPENAI_API_KEY=
 GEMINI_API_KEY=
 CONFLUENCE_URL=
 CONFLUENCE_TOKEN=
-CONFLUENCE_SPACE_KEY=
 ORG_API_KEY=
 REDIS_URL=                    # Railway injects this automatically if using Railway Redis
 DATABASE_URL=                 # SQLite for now: sqlite:////app/data/db/memora.db
@@ -216,6 +453,8 @@ JOBS_DIR=/app/data/jobs
 MOCK_TRANSCRIPTION=false
 MOCK_AGENT=false
 PORT=8000                     # Railway injects this; FastAPI must bind to 0.0.0.0:$PORT
+RECORDING_AUTH_MODE=none      # none | token | oauth
+WEBEX_SERVICE_TOKEN=          # only required if RECORDING_AUTH_MODE=token
 ```
 
 ### Railway-specific code changes needed:
@@ -249,6 +488,10 @@ These architectural decisions are intentional. Do not simplify or remove them:
   that changes when moving to PostgreSQL.
 - **auth.py** must be middleware, not inline in route handlers. SSO replaces
   the middleware later without touching routes.
+- **recording_downloader.py** must use `RecordingDownloader` ABC with
+  `PublicDownloader`, `TokenDownloader`, `OAuthDownloader` implementations.
+  Auth mode is selected via `RECORDING_AUTH_MODE` env var. No code changes
+  required when switching auth modes — only env var changes.
 - **confluence.py** page builder must be a separate module, not inlined in tasks.
 - All AI prompt templates must be in a separate `prompts.py` file,
   not hardcoded inside agent.py or tasks.py.

@@ -54,7 +54,7 @@ class ConfluenceClient:
         space_key: str | None = None,
     ) -> None:
         self.base_url = (base_url or settings.confluence_url).rstrip("/")
-        self.space_key = space_key or settings.confluence_space_key
+        self.space_key = space_key or ""
 
         # Confluence Cloud uses HTTP Basic auth: base64(email:api_token).
         # Bearer auth is only for Confluence Data Center PATs.
@@ -66,6 +66,43 @@ class ConfluenceClient:
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
+
+    # ------------------------------------------------------------------
+    # Search
+    # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Spaces / Pages — used by API endpoints for the destination picker
+    # ------------------------------------------------------------------
+
+    def get_spaces(self, limit: int = 100) -> list[dict[str, str]]:
+        """Return all accessible Confluence spaces: [{key, name}, ...]."""
+        url = f"{self.base_url}/rest/api/space"
+        params = {"limit": limit}
+        with httpx.Client(timeout=15) as client:
+            response = client.get(url, params=params, headers=self._headers)
+            response.raise_for_status()
+            return [
+                {"key": s["key"], "name": s["name"]}
+                for s in response.json().get("results", [])
+            ]
+
+    def get_pages(self, space_key: str, limit: int = 200) -> list[dict[str, str]]:
+        """Return pages in *space_key*: [{id, title}, ...]."""
+        url = f"{self.base_url}/rest/api/content"
+        params = {
+            "spaceKey": space_key,
+            "type": "page",
+            "limit": limit,
+            "status": "current",
+        }
+        with httpx.Client(timeout=15) as client:
+            response = client.get(url, params=params, headers=self._headers)
+            response.raise_for_status()
+            return [
+                {"id": r["id"], "title": r["title"]}
+                for r in response.json().get("results", [])
+            ]
 
     # ------------------------------------------------------------------
     # Search
@@ -85,7 +122,10 @@ class ConfluenceClient:
             List of dicts with keys ``id``, ``title``, ``url``.
             Returns an empty list if the search fails (non-fatal in the agent loop).
         """
-        cql = f'space = "{self.space_key}" AND title ~ "{query}" AND type = page'
+        if self.space_key:
+            cql = f'space = "{self.space_key}" AND title ~ "{query}" AND type = page'
+        else:
+            cql = f'title ~ "{query}" AND type = page'
         url = f"{self.base_url}/rest/api/content/search"
         params = {"cql": cql, "limit": limit, "expand": "version"}
 
@@ -144,6 +184,12 @@ class ConfluenceClient:
         url = f"{self.base_url}/rest/api/content"
         with httpx.Client(timeout=30) as client:
             response = client.post(url, json=payload, headers=self._headers)
+            if not response.is_success:
+                logger.error(
+                    "create_page failed %s — title=%r space=%r parent=%r body_len=%d — response: %s",
+                    response.status_code, title, payload.get("space"), parent_id,
+                    len(body), response.text[:800],
+                )
             response.raise_for_status()
             page = response.json()
             return {"page_id": page["id"], "url": self._page_url(page)}
@@ -195,6 +241,19 @@ class ConfluenceClient:
             response = client.get(url, params={"expand": "version"}, headers=self._headers)
             response.raise_for_status()
             return response.json()["version"]["number"]
+
+    # ------------------------------------------------------------------
+    # Screenshot embedding — §4.4 stub (TODO: implement with ffmpeg capture)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def embed_screenshot(page_body: str, screenshot_path: str, position: int) -> str:  # noqa: ARG004
+        """TODO: embed screenshot into page_body at the given position."""
+        return page_body
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
 
     def _page_url(self, page: dict) -> str:
         # Use the webui link from the API response — it contains the correct

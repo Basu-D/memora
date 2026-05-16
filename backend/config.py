@@ -21,7 +21,6 @@ class Settings(BaseSettings):
     confluence_url: str = ""
     confluence_email: str = ""    # Atlassian account email used for Basic auth
     confluence_token: str = ""
-    confluence_space_key: str = ""
 
     # Auth
     org_api_key: str = "changeme"

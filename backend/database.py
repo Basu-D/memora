@@ -61,6 +61,16 @@ class Job(Base):
     updated_at = Column(DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
     output_type = Column(String(32), nullable=False, default="detailed")
     publish_to_confluence = Column(Boolean, nullable=False, default=True)
+    custom_instructions = Column(Text, nullable=True)
+    # §4.5 — user-selected Confluence destination
+    confluence_space_key = Column(String(64), nullable=True)
+    confluence_parent_page_id = Column(String(64), nullable=True)
+    confluence_page_title = Column(String(512), nullable=True)
+    # §4.3 — optional meeting context
+    context_text = Column(Text, nullable=True)
+    confluence_reference_url = Column(String(2048), nullable=True)
+    # §4.4 — screenshot capture (stub)
+    screenshots_enabled = Column(Boolean, nullable=False, default=False)
     error_message = Column(Text, nullable=True)
     confluence_url = Column(String(2048), nullable=True)
     result_json = Column(Text, nullable=True)
@@ -90,20 +100,16 @@ def create_job(
     source_url: str | None = None,
     output_type: str = "detailed",
     publish_to_confluence: bool = True,
+    custom_instructions: str | None = None,
+    confluence_space_key: str | None = None,
+    confluence_parent_page_id: str | None = None,
+    confluence_page_title: str | None = None,
+    context_text: str | None = None,
+    confluence_reference_url: str | None = None,
+    screenshots_enabled: bool = False,
 ) -> Job:
     """
     Insert a new Job row with status UPLOADED and return it.
-
-    Args:
-        db: Active SQLAlchemy session.
-        filename: Original name of the uploaded recording file.
-        storage_path: Relative path of the saved file inside the uploads directory.
-        source_url: URL to download from (URL-submitted jobs only).
-        output_type: One of detailed | mom | quick_summary | action_items.
-        publish_to_confluence: Whether to publish the result as a Confluence page.
-
-    Returns:
-        The newly created and committed Job instance.
     """
     job = Job(
         filename=filename,
@@ -111,6 +117,13 @@ def create_job(
         source_url=source_url,
         output_type=output_type,
         publish_to_confluence=publish_to_confluence,
+        custom_instructions=custom_instructions,
+        confluence_space_key=confluence_space_key,
+        confluence_parent_page_id=confluence_parent_page_id,
+        confluence_page_title=confluence_page_title,
+        context_text=context_text,
+        confluence_reference_url=confluence_reference_url,
+        screenshots_enabled=screenshots_enabled,
     )
     db.add(job)
     db.commit()
@@ -202,6 +215,16 @@ def init_db() -> None:
         "ALTER TABLE jobs ADD COLUMN source_url VARCHAR(2048)",
         "ALTER TABLE jobs ADD COLUMN output_type VARCHAR(32) NOT NULL DEFAULT 'detailed'",
         "ALTER TABLE jobs ADD COLUMN publish_to_confluence BOOLEAN NOT NULL DEFAULT 1",
+        "ALTER TABLE jobs ADD COLUMN custom_instructions TEXT",
+        # §4.5 — Confluence destination
+        "ALTER TABLE jobs ADD COLUMN confluence_space_key VARCHAR(64)",
+        "ALTER TABLE jobs ADD COLUMN confluence_parent_page_id VARCHAR(64)",
+        "ALTER TABLE jobs ADD COLUMN confluence_page_title VARCHAR(512)",
+        # §4.3 — context input
+        "ALTER TABLE jobs ADD COLUMN context_text TEXT",
+        "ALTER TABLE jobs ADD COLUMN confluence_reference_url VARCHAR(2048)",
+        # §4.4 — screenshot stub
+        "ALTER TABLE jobs ADD COLUMN screenshots_enabled BOOLEAN NOT NULL DEFAULT 0",
     ]
     with engine.connect() as conn:
         for sql in _migrations:

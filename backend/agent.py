@@ -169,7 +169,12 @@ class MeetingAgent:
 
     def __init__(self) -> None:
         genai.configure(api_key=settings.gemini_api_key)
-        self._confluence = ConfluenceClient()
+        # ConfluenceClient is created lazily in _run_tool_loop_raw with the
+        # job's destination space key (no global CONFLUENCE_SPACE_KEY anymore).
+        self._confluence: ConfluenceClient | None = None
+        self._dest_space_key: str = ""
+        self._dest_parent_page_id: str = ""
+        self._pre_rendered_body: str = ""
 
         # Phase 1: JSON extraction model (no tools, JSON response mode)
         self._extraction_model = genai.GenerativeModel(
@@ -201,6 +206,9 @@ class MeetingAgent:
         job_id: str,
         output_type: str = "detailed",
         publish_to_confluence: bool = True,
+        custom_instructions: str = "",
+        confluence_destination: dict | None = None,
+        context_text: str = "",
     ) -> dict[str, Any]:
         """
         Execute the full two-phase pipeline.
@@ -210,20 +218,29 @@ class MeetingAgent:
             job_id: Used only for logging context.
             output_type: Controls extraction schema and page format.
             publish_to_confluence: When False, Phase 2 is skipped entirely.
+            confluence_destination: {space_key, parent_page_id, page_title} from job.
+            context_text: Optional background context passed to Gemini extraction.
 
         Returns:
             Result dict suitable for writing to result.json.
-
-        Raises:
-            Any exception from either phase propagates to the caller
-            (tasks.process_recording), which marks the job FAILED.
         """
         if settings.mock_agent:
             logger.info("[%s] MOCK agent — output_type=%s publish=%s", job_id, output_type, publish_to_confluence)
             return self._mock_result(output_type)
 
-        logger.info("[%s] Phase 1 — extraction (output_type=%s)", job_id, output_type)
-        extracted = self._extract_structured(transcript, job_id, output_type=output_type)
+        dest = confluence_destination or {}
+        space_key = dest.get("space_key") or ""
+        parent_page_id = dest.get("parent_page_id") or ""
+        page_title_override = dest.get("page_title") or ""
+
+        logger.info("[%s] Phase 1 — extraction (output_type=%s, custom_instructions=%s, context=%s)",
+                    job_id, output_type, bool(custom_instructions), bool(context_text))
+        extracted = self._extract_structured(
+            transcript, job_id,
+            output_type=output_type,
+            custom_instructions=custom_instructions,
+            context_text=context_text,
+        )
 
         meeting_type = extracted.get("meeting_type", "general") or "general"
         if meeting_type not in MEETING_TYPES:
@@ -234,14 +251,19 @@ class MeetingAgent:
         logger.info("[%s] Page body rendered: %d chars", job_id, len(page_body))
 
         action_items = extracted.get("action_items") or []
+        # Use user-supplied page title override, fallback to extracted title
+        publish_title = page_title_override or extracted.get("title", "Meeting Notes")
 
         if publish_to_confluence:
-            logger.info("[%s] Phase 2 — Confluence tool loop", job_id)
+            logger.info("[%s] Phase 2 — Confluence tool loop (space=%r, parent=%r)",
+                        job_id, space_key, parent_page_id)
             loop_result = self._run_tool_loop_raw(
-                title=extracted.get("title", "Meeting Notes"),
+                title=publish_title,
                 page_body=page_body,
                 action_items=action_items,
                 job_id=job_id,
+                space_key=space_key,
+                parent_page_id=parent_page_id,
             )
         else:
             logger.info("[%s] Confluence publish skipped (publish_to_confluence=False)", job_id)
@@ -253,7 +275,7 @@ class MeetingAgent:
 
         result: dict[str, Any] = {
             "output_type":             output_type,
-            "title":                   extracted.get("title", "Meeting Notes"),
+            "title":                   publish_title,
             "confluence_url":          loop_result.confluence_url,
             "page_action":             loop_result.page_action,
             "incomplete_action_items": loop_result.incomplete_action_items,
@@ -354,14 +376,26 @@ class MeetingAgent:
     # Phase 1 — structured extraction
     # ------------------------------------------------------------------
 
-    def _extract_structured(self, transcript: str, job_id: str, output_type: str = "detailed") -> dict[str, Any]:
+    def _extract_structured(
+        self,
+        transcript: str,
+        job_id: str,
+        output_type: str = "detailed",
+        custom_instructions: str = "",
+        context_text: str = "",
+    ) -> dict[str, Any]:
         """
         Ask Gemini to parse the transcript and return a structured JSON dict.
 
         Falls back to safe empty defaults on any parse failure so Phase 2
         can still proceed (the page will just have less content).
         """
-        prompt = build_extraction_prompt(transcript, output_type=output_type)
+        prompt = build_extraction_prompt(
+            transcript,
+            output_type=output_type,
+            custom_instructions=custom_instructions,
+            context_text=context_text,
+        )
         response = self._extraction_model.generate_content(prompt)
         raw = response.text.strip()
 
@@ -398,16 +432,27 @@ class MeetingAgent:
         page_body: str,
         action_items: list[dict],
         job_id: str,
+        space_key: str = "",
+        parent_page_id: str = "",
     ) -> _ToolLoopResult:
         """
         Start a Gemini chat with the 4 tools, feed the action prompt, then
         execute tool calls until the model stops or MAX_TOOL_TURNS is reached.
         """
+        # Create the client with the destination space so search_pages scopes correctly.
+        self._confluence = ConfluenceClient(space_key=space_key)
+        self._dest_space_key = space_key
+        self._dest_parent_page_id = parent_page_id
+        # Always use our pre-rendered body — ignore whatever body Gemini supplies in the
+        # tool call args (Gemini tends to rewrite it, producing invalid Confluence XML).
+        self._pre_rendered_body = page_body
+
         ctx = _ToolLoopResult()
 
         prompt = build_action_prompt(
             title=title,
-            space_key=settings.confluence_space_key,
+            space_key=space_key,
+            parent_page_id=parent_page_id,
             body=page_body,
             action_items_json=json.dumps(action_items, ensure_ascii=False, indent=2),
         )
@@ -467,8 +512,8 @@ class MeetingAgent:
             result = self._tool_create_confluence_page(
                 title=args.get("title", ""),
                 body=args.get("body", ""),
-                space_key=args.get("space_key", settings.confluence_space_key),
-                parent_id=args.get("parent_id", "") or None,
+                space_key=args.get("space_key") or self._dest_space_key,
+                parent_id=args.get("parent_id") or self._dest_parent_page_id or None,
             )
             ctx.page_id = result.get("page_id", "")
             ctx.confluence_url = result.get("url", "")
@@ -517,21 +562,21 @@ class MeetingAgent:
     def _tool_create_confluence_page(
         self,
         title: str,
-        body: str,
+        body: str,  # noqa: ARG002 — ignored; we always use self._pre_rendered_body
         space_key: str,
         parent_id: str | None,
     ) -> dict[str, str]:
         """
         Create a Confluence page and return ``{"page_id", "url"}``.
 
-        Raises:
-            httpx.HTTPStatusError: Propagates to the tool loop which will log it
-            and mark the job FAILED.
+        The `body` argument from Gemini is intentionally ignored — Gemini often
+        rewrites the body with invalid Confluence XML.  We always use the
+        pre-rendered body stored in ``self._pre_rendered_body``.
         """
         return self._confluence.create_page(
             title=title,
-            body=body,
-            space_key=space_key or settings.confluence_space_key,
+            body=self._pre_rendered_body,
+            space_key=space_key,
             parent_id=parent_id,
         )
 
@@ -539,18 +584,16 @@ class MeetingAgent:
         self,
         page_id: str,
         title: str,
-        body: str,
+        body: str,  # noqa: ARG002 — ignored; see above
     ) -> dict[str, str]:
         """
         Update an existing Confluence page and return ``{"page_id", "url"}``.
-
-        Raises:
-            httpx.HTTPStatusError: Propagates to the tool loop.
+        Body is always the pre-rendered version, not Gemini's rewrite.
         """
         return self._confluence.update_page(
             page_id=page_id,
             title=title,
-            body=body,
+            body=self._pre_rendered_body,
         )
 
     @staticmethod
@@ -589,7 +632,14 @@ class MeetingAgent:
 # Public entry point called by tasks.process_recording
 # ---------------------------------------------------------------------------
 
-def run_agent(job_id: str, output_type: str = "detailed", publish_to_confluence: bool = True) -> None:
+def run_agent(
+    job_id: str,
+    output_type: str = "detailed",
+    publish_to_confluence: bool = True,
+    custom_instructions: str = "",
+    confluence_destination: dict | None = None,
+    context_text: str = "",
+) -> None:
     """
     Orchestrate the full agent pipeline for one job:
       1. Read jobs/{job_id}/transcript.json
@@ -599,9 +649,6 @@ def run_agent(job_id: str, output_type: str = "detailed", publish_to_confluence:
 
     Any exception propagates to tasks.process_recording, which calls
     _mark_failed_new_session and returns.
-
-    Args:
-        job_id: UUID matching the Job row and the directory under jobs_dir.
     """
     from database import JobStatus, SessionLocal, update_job_status
 
@@ -628,6 +675,9 @@ def run_agent(job_id: str, output_type: str = "detailed", publish_to_confluence:
         job_id=job_id,
         output_type=output_type,
         publish_to_confluence=publish_to_confluence,
+        custom_instructions=custom_instructions,
+        confluence_destination=confluence_destination,
+        context_text=context_text,
     )
 
     # ----------------------------------------------------------------- write result.json

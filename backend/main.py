@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 
 from auth import APIKeyMiddleware
 from config import settings
+from confluence import ConfluenceClient
 from database import JobStatus, create_job, get_db, get_job, init_db, update_job_status
 from tasks import process_recording
 
@@ -83,6 +84,36 @@ async def health() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Confluence destination helpers
+# ---------------------------------------------------------------------------
+
+@app.get("/confluence/spaces", tags=["confluence"])
+async def list_confluence_spaces() -> JSONResponse:
+    """Return available Confluence spaces for the destination picker."""
+    try:
+        client = ConfluenceClient()
+        spaces = client.get_spaces()
+        return JSONResponse(content=spaces)
+    except Exception as exc:
+        logger.error("Failed to fetch Confluence spaces: %s", exc)
+        raise HTTPException(status_code=502, detail=f"Could not fetch Confluence spaces: {exc}") from exc
+
+
+@app.get("/confluence/pages", tags=["confluence"])
+async def list_confluence_pages(space_key: str) -> JSONResponse:
+    """Return pages in a Confluence space for the parent page picker."""
+    if not space_key.strip():
+        raise HTTPException(status_code=400, detail="space_key is required.")
+    try:
+        client = ConfluenceClient()
+        pages = client.get_pages(space_key)
+        return JSONResponse(content=pages)
+    except Exception as exc:
+        logger.error("Failed to fetch pages for space %r: %s", space_key, exc)
+        raise HTTPException(status_code=502, detail=f"Could not fetch pages: {exc}") from exc
+
+
+# ---------------------------------------------------------------------------
 # POST /upload
 # ---------------------------------------------------------------------------
 
@@ -91,6 +122,13 @@ async def upload_meeting(
     file: UploadFile = File(...),
     output_type: str = Form("detailed"),
     publish_to_confluence: bool = Form(True),
+    custom_instructions: str = Form(""),
+    confluence_space_key: str = Form(""),
+    confluence_parent_page_id: str = Form(""),
+    confluence_page_title: str = Form(""),
+    context_text: str = Form(""),
+    confluence_reference_url: str = Form(""),
+    screenshots_enabled: bool = Form(False),
     db: Session = Depends(get_db),
 ) -> JSONResponse:
     """
@@ -156,6 +194,13 @@ async def upload_meeting(
         storage_path=storage_filename,
         output_type=output_type,
         publish_to_confluence=publish_to_confluence,
+        custom_instructions=custom_instructions.strip() or None,
+        confluence_space_key=confluence_space_key.strip() or None,
+        confluence_parent_page_id=confluence_parent_page_id.strip() or None,
+        confluence_page_title=confluence_page_title.strip() or None,
+        context_text=context_text.strip() or None,
+        confluence_reference_url=confluence_reference_url.strip() or None,
+        screenshots_enabled=screenshots_enabled,
     )
 
     # --- Queue Celery task --------------------------------------------------
@@ -177,6 +222,13 @@ class UrlSubmitRequest(BaseModel):
     title: str = ""
     output_type: str = "detailed"
     publish_to_confluence: bool = True
+    custom_instructions: str = ""
+    confluence_space_key: str = ""
+    confluence_parent_page_id: str = ""
+    confluence_page_title: str = ""
+    context_text: str = ""
+    confluence_reference_url: str = ""
+    screenshots_enabled: bool = False
 
 
 @app.post("/upload-url", status_code=status.HTTP_202_ACCEPTED, tags=["jobs"])
@@ -214,6 +266,13 @@ async def upload_from_url(
         source_url=body.url,
         output_type=body.output_type,
         publish_to_confluence=body.publish_to_confluence,
+        custom_instructions=body.custom_instructions.strip() or None,
+        confluence_space_key=body.confluence_space_key.strip() or None,
+        confluence_parent_page_id=body.confluence_parent_page_id.strip() or None,
+        confluence_page_title=body.confluence_page_title.strip() or None,
+        context_text=body.context_text.strip() or None,
+        confluence_reference_url=body.confluence_reference_url.strip() or None,
+        screenshots_enabled=body.screenshots_enabled,
     )
     process_recording.delay(job.id)
 
