@@ -7,6 +7,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import os
 import re
 import uuid
 from pathlib import Path
@@ -56,9 +57,11 @@ app = FastAPI(
     version="0.1.0",
 )
 
+origins = os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.cors_origins,
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -553,3 +556,9 @@ def _build_docx(result: dict) -> bytes:
     buf = io.BytesIO()
     doc.save(buf)
     return buf.getvalue()
+
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
