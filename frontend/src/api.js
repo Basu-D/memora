@@ -58,10 +58,12 @@ async function apiFetch(path, options = {}) {
  * @param {string} title  — Optional meeting title hint (sent as a form field).
  * @returns {Promise<{job_id: string, status: string}>}
  */
-export async function uploadMeeting(file, title = "") {
+export async function uploadMeeting(file, title = "", outputType = "detailed", publishToConfluence = true) {
   const formData = new FormData();
   formData.append("file", file);
   if (title.trim()) formData.append("title", title.trim());
+  formData.append("output_type", outputType);
+  formData.append("publish_to_confluence", String(publishToConfluence));
 
   const response = await apiFetch("/upload", {
     method: "POST",
@@ -83,11 +85,16 @@ export async function uploadMeeting(file, title = "") {
  * @param {string} title  — Optional meeting title hint.
  * @returns {Promise<{job_id: string, status: string}>}
  */
-export async function submitUrlMeeting(url, title = "") {
+export async function submitUrlMeeting(url, title = "", outputType = "detailed", publishToConfluence = true) {
   const response = await apiFetch("/upload-url", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ url, title: title.trim() }),
+    body: JSON.stringify({
+      url,
+      title: title.trim(),
+      output_type: outputType,
+      publish_to_confluence: publishToConfluence,
+    }),
   });
   return response.json();
 }

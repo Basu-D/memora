@@ -12,7 +12,7 @@ import uuid
 from pathlib import Path
 from urllib.parse import urlparse
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile, Depends, status
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
@@ -89,6 +89,8 @@ async def health() -> dict:
 @app.post("/upload", status_code=status.HTTP_202_ACCEPTED, tags=["jobs"])
 async def upload_meeting(
     file: UploadFile = File(...),
+    output_type: str = Form("detailed"),
+    publish_to_confluence: bool = Form(True),
     db: Session = Depends(get_db),
 ) -> JSONResponse:
     """
@@ -148,7 +150,13 @@ async def upload_meeting(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Uploaded file is empty.")
 
     # --- Create DB record ---------------------------------------------------
-    job = create_job(db, filename=original_name, storage_path=storage_filename)
+    job = create_job(
+        db,
+        filename=original_name,
+        storage_path=storage_filename,
+        output_type=output_type,
+        publish_to_confluence=publish_to_confluence,
+    )
 
     # --- Queue Celery task --------------------------------------------------
     process_recording.delay(job.id)
@@ -167,6 +175,8 @@ async def upload_meeting(
 class UrlSubmitRequest(BaseModel):
     url: str
     title: str = ""
+    output_type: str = "detailed"
+    publish_to_confluence: bool = True
 
 
 @app.post("/upload-url", status_code=status.HTTP_202_ACCEPTED, tags=["jobs"])
@@ -198,7 +208,13 @@ async def upload_from_url(
     if body.title.strip():
         display_name = body.title.strip()
 
-    job = create_job(db, filename=display_name, source_url=body.url)
+    job = create_job(
+        db,
+        filename=display_name,
+        source_url=body.url,
+        output_type=body.output_type,
+        publish_to_confluence=body.publish_to_confluence,
+    )
     process_recording.delay(job.id)
 
     logger.info("Job %s queued from URL: %s", job.id, body.url)
@@ -357,66 +373,123 @@ def _build_docx(result: dict) -> bytes:
     from docx.shared import Pt
 
     doc = Document()
+    output_type = result.get("output_type", "detailed")
 
-    # Title
     doc.add_heading(result.get("title") or "Meeting Notes", level=0)
 
-    # Meta line: type + attendees
-    meeting_type = result.get("meeting_type", "")
-    attendees = result.get("attendees") or []
-    meta_parts = []
-    if meeting_type:
-        meta_parts.append(meeting_type.replace("-", " ").title())
-    if attendees:
-        meta_parts.append("Attendees: " + ", ".join(attendees))
-    if meta_parts:
-        p = doc.add_paragraph()
-        run = p.add_run("  |  ".join(meta_parts))
-        run.italic = True
-        run.font.size = Pt(10)
+    if output_type == "quick_summary":
+        bullets = result.get("bullets") or []
+        if bullets:
+            doc.add_heading("Summary", level=1)
+            for b in bullets:
+                doc.add_paragraph(f"• {b}")
+        action_items = result.get("action_items") or []
+        if action_items:
+            doc.add_heading("Action Items", level=1)
+            for item in action_items:
+                owner = item.get("owner") or "Unassigned"
+                due = item.get("due") or "TBD"
+                doc.add_paragraph(f"• {owner}: {item.get('task','')} (by {due})")
 
-    # Summary
-    summary = result.get("summary", "")
-    if summary:
-        doc.add_heading("Summary", level=1)
-        doc.add_paragraph(summary)
+    elif output_type == "action_items":
+        action_items = result.get("action_items") or []
+        if action_items:
+            doc.add_heading("Action Items", level=1)
+            tbl = doc.add_table(rows=1, cols=3)
+            tbl.style = "Table Grid"
+            hdr = tbl.rows[0].cells
+            hdr[0].text = "Owner"
+            hdr[1].text = "Task"
+            hdr[2].text = "Due"
+            for item in action_items:
+                row = tbl.add_row().cells
+                row[0].text = item.get("owner") or ""
+                row[1].text = item.get("task") or ""
+                row[2].text = item.get("due") or ""
 
-    # Decisions
-    decisions = result.get("decisions") or []
-    if decisions:
-        doc.add_heading("Decisions", level=1)
-        for i, text in enumerate(decisions, 1):
-            doc.add_paragraph(f"{i}. {text}")
+    elif output_type == "mom":
+        meeting_type = result.get("meeting_type", "")
+        attendees = result.get("attendees") or []
+        date = result.get("date", "")
+        meta_parts = []
+        if meeting_type:
+            meta_parts.append(meeting_type.replace("-", " ").title())
+        if date:
+            meta_parts.append(f"Date: {date}")
+        if attendees:
+            meta_parts.append("Attendees: " + ", ".join(attendees))
+        if meta_parts:
+            p = doc.add_paragraph()
+            run = p.add_run("  |  ".join(meta_parts))
+            run.italic = True
+            run.font.size = Pt(10)
+        for heading, key in [("Agenda Items", "agenda_items"), ("Decisions", "decisions")]:
+            items = result.get(key) or []
+            if items:
+                doc.add_heading(heading, level=1)
+                for i, text in enumerate(items, 1):
+                    doc.add_paragraph(f"{i}. {text}")
+        action_items = result.get("action_items") or []
+        if action_items:
+            doc.add_heading("Action Items", level=1)
+            tbl = doc.add_table(rows=1, cols=3)
+            tbl.style = "Table Grid"
+            hdr = tbl.rows[0].cells
+            hdr[0].text = "Owner"
+            hdr[1].text = "Task"
+            hdr[2].text = "Due"
+            for item in action_items:
+                row = tbl.add_row().cells
+                row[0].text = item.get("owner") or ""
+                row[1].text = item.get("task") or ""
+                row[2].text = item.get("due") or ""
+        next_steps = result.get("next_steps") or []
+        if next_steps:
+            doc.add_heading("Next Steps", level=1)
+            for text in next_steps:
+                doc.add_paragraph(f"• {text}")
 
-    # Action Items — table
-    action_items = result.get("action_items") or []
-    if action_items:
-        doc.add_heading("Action Items", level=1)
-        tbl = doc.add_table(rows=1, cols=3)
-        tbl.style = "Table Grid"
-        hdr = tbl.rows[0].cells
-        hdr[0].text = "Owner"
-        hdr[1].text = "Task"
-        hdr[2].text = "Due"
-        for item in action_items:
-            row = tbl.add_row().cells
-            row[0].text = item.get("owner") or ""
-            row[1].text = item.get("task") or ""
-            row[2].text = item.get("due") or ""
-
-    # Open Questions
-    open_questions = result.get("open_questions") or []
-    if open_questions:
-        doc.add_heading("Open Questions", level=1)
-        for i, text in enumerate(open_questions, 1):
-            doc.add_paragraph(f"{i}. {text}")
-
-    # Highlights
-    highlights = result.get("highlights") or []
-    if highlights:
-        doc.add_heading("Highlights", level=1)
-        for text in highlights:
-            doc.add_paragraph(f"• {text}")
+    else:  # detailed
+        meeting_type = result.get("meeting_type", "")
+        attendees = result.get("attendees") or []
+        meta_parts = []
+        if meeting_type:
+            meta_parts.append(meeting_type.replace("-", " ").title())
+        if attendees:
+            meta_parts.append("Attendees: " + ", ".join(attendees))
+        if meta_parts:
+            p = doc.add_paragraph()
+            run = p.add_run("  |  ".join(meta_parts))
+            run.italic = True
+            run.font.size = Pt(10)
+        if result.get("summary"):
+            doc.add_heading("Summary", level=1)
+            doc.add_paragraph(result["summary"])
+        decisions = result.get("decisions") or []
+        if decisions:
+            doc.add_heading("Decisions", level=1)
+            for i, text in enumerate(decisions, 1):
+                doc.add_paragraph(f"{i}. {text}")
+        action_items = result.get("action_items") or []
+        if action_items:
+            doc.add_heading("Action Items", level=1)
+            tbl = doc.add_table(rows=1, cols=3)
+            tbl.style = "Table Grid"
+            hdr = tbl.rows[0].cells
+            hdr[0].text = "Owner"
+            hdr[1].text = "Task"
+            hdr[2].text = "Due"
+            for item in action_items:
+                row = tbl.add_row().cells
+                row[0].text = item.get("owner") or ""
+                row[1].text = item.get("task") or ""
+                row[2].text = item.get("due") or ""
+        for heading, key in [("Open Questions", "open_questions"), ("Highlights", "highlights")]:
+            items = result.get(key) or []
+            if items:
+                doc.add_heading(heading, level=1)
+                for i, text in enumerate(items, 1):
+                    doc.add_paragraph(f"{i}. {text}")
 
     buf = io.BytesIO()
     doc.save(buf)

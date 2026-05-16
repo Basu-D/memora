@@ -8,7 +8,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import create_engine, Column, String, Text, DateTime, Enum as SAEnum, text
+from sqlalchemy import create_engine, Column, String, Text, DateTime, Boolean, Enum as SAEnum, text
 from sqlalchemy.orm import DeclarativeBase, sessionmaker, Session
 
 from config import settings
@@ -25,6 +25,13 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 class Base(DeclarativeBase):
     pass
+
+
+class OutputType(str, enum.Enum):
+    DETAILED = "detailed"
+    MOM = "mom"
+    QUICK_SUMMARY = "quick_summary"
+    ACTION_ITEMS = "action_items"
 
 
 class JobStatus(str, enum.Enum):
@@ -52,6 +59,8 @@ class Job(Base):
     status = Column(SAEnum(JobStatus), nullable=False, default=JobStatus.UPLOADED)
     created_at = Column(DateTime(timezone=True), nullable=False, default=_now)
     updated_at = Column(DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
+    output_type = Column(String(32), nullable=False, default="detailed")
+    publish_to_confluence = Column(Boolean, nullable=False, default=True)
     error_message = Column(Text, nullable=True)
     confluence_url = Column(String(2048), nullable=True)
     result_json = Column(Text, nullable=True)
@@ -74,7 +83,14 @@ class Job(Base):
 # CRUD
 # ---------------------------------------------------------------------------
 
-def create_job(db: Session, filename: str, storage_path: str | None = None, source_url: str | None = None) -> Job:
+def create_job(
+    db: Session,
+    filename: str,
+    storage_path: str | None = None,
+    source_url: str | None = None,
+    output_type: str = "detailed",
+    publish_to_confluence: bool = True,
+) -> Job:
     """
     Insert a new Job row with status UPLOADED and return it.
 
@@ -82,11 +98,20 @@ def create_job(db: Session, filename: str, storage_path: str | None = None, sour
         db: Active SQLAlchemy session.
         filename: Original name of the uploaded recording file.
         storage_path: Relative path of the saved file inside the uploads directory.
+        source_url: URL to download from (URL-submitted jobs only).
+        output_type: One of detailed | mom | quick_summary | action_items.
+        publish_to_confluence: Whether to publish the result as a Confluence page.
 
     Returns:
         The newly created and committed Job instance.
     """
-    job = Job(filename=filename, storage_path=storage_path, source_url=source_url)
+    job = Job(
+        filename=filename,
+        storage_path=storage_path,
+        source_url=source_url,
+        output_type=output_type,
+        publish_to_confluence=publish_to_confluence,
+    )
     db.add(job)
     db.commit()
     db.refresh(job)
@@ -172,10 +197,16 @@ def get_db():
 def init_db() -> None:
     """Create all tables. Called once at application startup."""
     Base.metadata.create_all(bind=engine)
-    # Safe migration: add source_url column if it doesn't exist yet (SQLite).
+    # Safe migrations for columns added after initial deploy.
+    _migrations = [
+        "ALTER TABLE jobs ADD COLUMN source_url VARCHAR(2048)",
+        "ALTER TABLE jobs ADD COLUMN output_type VARCHAR(32) NOT NULL DEFAULT 'detailed'",
+        "ALTER TABLE jobs ADD COLUMN publish_to_confluence BOOLEAN NOT NULL DEFAULT 1",
+    ]
     with engine.connect() as conn:
-        try:
-            conn.execute(text("ALTER TABLE jobs ADD COLUMN source_url VARCHAR(2048)"))
-            conn.commit()
-        except Exception:
-            pass  # column already exists
+        for sql in _migrations:
+            try:
+                conn.execute(text(sql))
+                conn.commit()
+            except Exception:
+                pass  # column already exists

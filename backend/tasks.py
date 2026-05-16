@@ -69,6 +69,8 @@ def process_recording(self, job_id: str) -> None:
         job = get_job(db, job_id)           # raises ValueError if missing
         storage_path = job.storage_path
         source_url = job.source_url
+        output_type = job.output_type or "detailed"
+        publish_to_confluence = job.publish_to_confluence if job.publish_to_confluence is not None else True
     except ValueError as exc:
         logger.error("process_recording: job %s not found — %s", job_id, exc)
         db.close()
@@ -159,7 +161,7 @@ def process_recording(self, job_id: str) -> None:
     # --------------------------------------------------------- Step 3: agent
     try:
         from agent import run_agent
-        run_agent(job_id)
+        run_agent(job_id, output_type=output_type, publish_to_confluence=publish_to_confluence)
         logger.info("[%s] Agent complete", job_id)
     except Exception as exc:
         logger.exception("[%s] Agent/publish step failed", job_id)

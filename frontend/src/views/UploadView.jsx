@@ -5,6 +5,16 @@ const ACCEPTED_EXTENSIONS = [".mp4", ".mp3", ".webm", ".wav", ".m4a"];
 const ACCEPTED_ACCEPT      = ACCEPTED_EXTENSIONS.join(",");
 const MAX_BYTES            = 500 * 1024 * 1024; // 500 MB
 
+const OUTPUT_TYPES = [
+  { value: "detailed",      label: "Detailed Document",   description: "Full notes: summary, decisions, action items, open questions and highlights." },
+  { value: "mom",           label: "Minutes of Meeting",  description: "Formal MoM: agenda items discussed, decisions made, action items, next steps." },
+  { value: "quick_summary", label: "Quick Summary",       description: "3–5 bullet points covering what was discussed, decided, and who owns what." },
+  { value: "action_items",  label: "Action Items Only",   description: "Just the action items table: owner, task, and deadline." },
+];
+
+// Output types where Confluence should be on by default.
+const CONFLUENCE_ON_BY_DEFAULT = new Set(["detailed", "mom"]);
+
 function formatBytes(bytes) {
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
@@ -94,9 +104,16 @@ export default function UploadView({ onJobCreated }) {
   const [urlError,  setUrlError]  = useState(null);
 
   // ── shared state ────────────────────────────────────────────────────────
-  const [title,     setTitle]     = useState("");
-  const [submitting, setSubmitting] = useState(false);
-  const [submitErr, setSubmitErr] = useState(null);
+  const [title,               setTitle]               = useState("");
+  const [outputType,          setOutputType]          = useState("detailed");
+  const [publishToConfluence, setPublishToConfluence] = useState(true);
+  const [submitting,          setSubmitting]          = useState(false);
+  const [submitErr,           setSubmitErr]           = useState(null);
+
+  function handleOutputTypeChange(val) {
+    setOutputType(val);
+    setPublishToConfluence(CONFLUENCE_ON_BY_DEFAULT.has(val));
+  }
 
   const inputRef = useRef(null);
 
@@ -147,7 +164,7 @@ export default function UploadView({ onJobCreated }) {
       setSubmitting(true);
       setSubmitErr(null);
       try {
-        const { job_id } = await uploadMeeting(file, title);
+        const { job_id } = await uploadMeeting(file, title, outputType, publishToConfluence);
         onJobCreated(job_id);
       } catch (err) {
         setSubmitErr(err.message);
@@ -163,7 +180,7 @@ export default function UploadView({ onJobCreated }) {
       setSubmitting(true);
       setSubmitErr(null);
       try {
-        const { job_id } = await submitUrlMeeting(trimmed, title);
+        const { job_id } = await submitUrlMeeting(trimmed, title, outputType, publishToConfluence);
         onJobCreated(job_id);
       } catch (err) {
         setSubmitErr(err.message);
@@ -340,6 +357,40 @@ export default function UploadView({ onJobCreated }) {
           />
         </div>
 
+        {/* Output type */}
+        <div className="flex flex-col gap-1.5">
+          <label htmlFor="output-type" className="text-sm font-medium text-gray-700">
+            Output type
+          </label>
+          <select
+            id="output-type"
+            value={outputType}
+            onChange={(e) => handleOutputTypeChange(e.target.value)}
+            className="w-full rounded-xl border border-gray-200 bg-white px-4 py-2.5
+                       text-sm text-gray-900
+                       focus:outline-none focus:ring-2 focus:ring-teal-500/40 focus:border-teal-500
+                       transition-colors"
+          >
+            {OUTPUT_TYPES.map((t) => (
+              <option key={t.value} value={t.value}>{t.label}</option>
+            ))}
+          </select>
+          <p className="text-xs text-gray-400">
+            {OUTPUT_TYPES.find((t) => t.value === outputType)?.description}
+          </p>
+        </div>
+
+        {/* Confluence toggle */}
+        <label className="flex items-center gap-3 cursor-pointer select-none">
+          <input
+            type="checkbox"
+            checked={publishToConfluence}
+            onChange={(e) => setPublishToConfluence(e.target.checked)}
+            className="w-4 h-4 rounded border-gray-300 text-teal-600 accent-teal-600 cursor-pointer"
+          />
+          <span className="text-sm text-gray-700">Create Confluence page</span>
+        </label>
+
         {/* Submit error */}
         {submitErr && (
           <div className="rounded-xl bg-red-50 border border-red-100 px-4 py-3">
@@ -365,7 +416,7 @@ export default function UploadView({ onJobCreated }) {
       </form>
 
       <p className="mt-6 text-xs text-gray-400">
-        Audio is transcribed locally — your recording never leaves your infrastructure.
+        Transcription via OpenAI Whisper · AI extraction via Google Gemini · Notes published to your Confluence
       </p>
     </div>
   );

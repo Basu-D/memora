@@ -252,6 +252,7 @@ export default function ResultView({ jobId, onReset }) {
 
   // ── result data ──────────────────────────────────────────────────────────
   const result     = data?.result ?? {};
+  const outputType = result.output_type ?? "detailed";
   const typeMeta   = meetingTypeMeta(result.meeting_type);
   const incomplete = result.incomplete_action_items ?? [];
   const hasWarning = incomplete.length > 0;
@@ -301,23 +302,26 @@ export default function ResultView({ jobId, onReset }) {
 
         {/* ── Title block ─────────────────────────────────────────────── */}
         <div className="flex flex-col gap-2">
-          <div className="flex items-center gap-3 flex-wrap">
-            <span className={`px-3 py-1 rounded-full text-xs font-semibold ${typeMeta.color}`}>
-              {typeMeta.label}
-            </span>
-            {result.attendees?.length > 0 && (
-              <span className="text-sm text-gray-400">
-                {result.attendees.length} attendee{result.attendees.length !== 1 ? "s" : ""}
+          {(outputType === "detailed" || outputType === "mom") && (
+            <div className="flex items-center gap-3 flex-wrap">
+              <span className={`px-3 py-1 rounded-full text-xs font-semibold ${typeMeta.color}`}>
+                {typeMeta.label}
               </span>
-            )}
-          </div>
+              {result.attendees?.length > 0 && (
+                <span className="text-sm text-gray-400">
+                  {result.attendees.length} attendee{result.attendees.length !== 1 ? "s" : ""}
+                </span>
+              )}
+              {outputType === "mom" && result.date && (
+                <span className="text-sm text-gray-400">{result.date}</span>
+              )}
+            </div>
+          )}
           <h1 className="text-2xl font-bold text-gray-900 leading-snug">
             {result.title || "Meeting Notes"}
           </h1>
-          {result.attendees?.length > 0 && (
-            <p className="text-sm text-gray-500">
-              {result.attendees.join(" · ")}
-            </p>
+          {(outputType === "detailed" || outputType === "mom") && result.attendees?.length > 0 && (
+            <p className="text-sm text-gray-500">{result.attendees.join(" · ")}</p>
           )}
         </div>
 
@@ -336,8 +340,8 @@ export default function ResultView({ jobId, onReset }) {
           </div>
         )}
 
-        {/* ── Incomplete action items warning banner ───────────────────── */}
-        {hasWarning && (
+        {/* ── Incomplete action items banner (not shown for quick_summary) ── */}
+        {hasWarning && outputType !== "quick_summary" && (
           <div className="flex items-start gap-3 rounded-xl bg-amber-50 border border-amber-200 px-5 py-4">
             <WarningIcon className="w-5 h-5 text-amber-500 shrink-0 mt-0.5" />
             <div className="flex flex-col gap-1">
@@ -349,9 +353,7 @@ export default function ResultView({ jobId, onReset }) {
                   <li key={i} className="text-xs text-amber-700 flex items-center gap-1.5">
                     <span className="w-1 h-1 rounded-full bg-amber-500 shrink-0" />
                     <span className="font-medium">{item.task}</span>
-                    <span className="text-amber-500">
-                      — missing {item.missing?.join(" and ")}
-                    </span>
+                    <span className="text-amber-500">— missing {item.missing?.join(" and ")}</span>
                   </li>
                 ))}
               </ul>
@@ -359,58 +361,110 @@ export default function ResultView({ jobId, onReset }) {
           </div>
         )}
 
-        {/* ── Summary ─────────────────────────────────────────────────── */}
-        <SectionCard
-          title="Summary"
-          icon={<span className="text-teal-600 text-base">📋</span>}
-        >
-          {result.summary ? (
-            <p className="text-sm text-gray-700 leading-relaxed">{result.summary}</p>
-          ) : (
-            <EmptyState message="No summary available." />
-          )}
-        </SectionCard>
-
-        {/* ── Decisions ───────────────────────────────────────────────── */}
-        <SectionCard
-          title="Decisions"
-          icon={<span className="text-teal-600 text-base">⚖️</span>}
-        >
-          <DecisionsSection decisions={result.decisions} />
-        </SectionCard>
-
-        {/* ── Action Items ─────────────────────────────────────────────── */}
-        <SectionCard
-          title={`Action Items${result.action_items?.length ? ` (${result.action_items.length})` : ""}`}
-          icon={<span className="text-teal-600 text-base">✅</span>}
-        >
-          <ActionItemsTable items={result.action_items} incomplete={incomplete} />
-        </SectionCard>
-
-        {/* ── Open Questions ───────────────────────────────────────────── */}
-        {(result.open_questions?.length > 0) && (
-          <SectionCard
-            title="Open Questions"
-            icon={<span className="text-teal-600 text-base">❓</span>}
-          >
-            <BulletList
-              items={result.open_questions}
-              numbered
-              emptyText="No open questions recorded."
-            />
+        {/* ════════════════════════════════════════════════════════════════
+            DETAILED
+        ════════════════════════════════════════════════════════════════ */}
+        {outputType === "detailed" && (<>
+          <SectionCard title="Summary" icon={<span className="text-teal-600 text-base">📋</span>}>
+            {result.summary
+              ? <p className="text-sm text-gray-700 leading-relaxed">{result.summary}</p>
+              : <EmptyState message="No summary available." />}
           </SectionCard>
-        )}
 
-        {/* ── Highlights ───────────────────────────────────────────────── */}
-        {(result.highlights?.length > 0) && (
+          <SectionCard title="Decisions" icon={<span className="text-teal-600 text-base">⚖️</span>}>
+            <DecisionsSection decisions={result.decisions} />
+          </SectionCard>
+
           <SectionCard
-            title="Highlights"
-            icon={<span className="text-teal-600 text-base">✨</span>}
+            title={`Action Items${result.action_items?.length ? ` (${result.action_items.length})` : ""}`}
+            icon={<span className="text-teal-600 text-base">✅</span>}
           >
-            <BulletList
-              items={result.highlights}
-              emptyText="No highlights recorded."
-            />
+            <ActionItemsTable items={result.action_items} incomplete={incomplete} />
+          </SectionCard>
+
+          {result.open_questions?.length > 0 && (
+            <SectionCard title="Open Questions" icon={<span className="text-teal-600 text-base">❓</span>}>
+              <BulletList items={result.open_questions} numbered emptyText="No open questions recorded." />
+            </SectionCard>
+          )}
+
+          {result.highlights?.length > 0 && (
+            <SectionCard title="Highlights" icon={<span className="text-teal-600 text-base">✨</span>}>
+              <BulletList items={result.highlights} emptyText="No highlights recorded." />
+            </SectionCard>
+          )}
+        </>)}
+
+        {/* ════════════════════════════════════════════════════════════════
+            MINUTES OF MEETING
+        ════════════════════════════════════════════════════════════════ */}
+        {outputType === "mom" && (<>
+          <SectionCard title="Agenda Items Discussed" icon={<span className="text-teal-600 text-base">📋</span>}>
+            <BulletList items={result.agenda_items} numbered emptyText="No agenda items recorded." />
+          </SectionCard>
+
+          <SectionCard title="Decisions Made" icon={<span className="text-teal-600 text-base">⚖️</span>}>
+            <DecisionsSection decisions={result.decisions} />
+          </SectionCard>
+
+          <SectionCard
+            title={`Action Items${result.action_items?.length ? ` (${result.action_items.length})` : ""}`}
+            icon={<span className="text-teal-600 text-base">✅</span>}
+          >
+            <ActionItemsTable items={result.action_items} incomplete={incomplete} />
+          </SectionCard>
+
+          {result.next_steps?.length > 0 && (
+            <SectionCard title="Next Steps" icon={<span className="text-teal-600 text-base">➡️</span>}>
+              <BulletList items={result.next_steps} numbered emptyText="No next steps recorded." />
+            </SectionCard>
+          )}
+        </>)}
+
+        {/* ════════════════════════════════════════════════════════════════
+            QUICK SUMMARY
+        ════════════════════════════════════════════════════════════════ */}
+        {outputType === "quick_summary" && (<>
+          <SectionCard title="Summary" icon={<span className="text-teal-600 text-base">⚡</span>}>
+            <BulletList items={result.bullets} emptyText="No summary available." />
+          </SectionCard>
+
+          {result.action_items?.length > 0 && (
+            <SectionCard
+              title={`Action Items (${result.action_items.length})`}
+              icon={<span className="text-teal-600 text-base">✅</span>}
+            >
+              <ol className="flex flex-col gap-2">
+                {result.action_items.map((item, i) => (
+                  <li key={i} className="flex items-start gap-3 text-sm text-gray-700">
+                    <span className="shrink-0 w-5 h-5 rounded-full bg-teal-100 text-teal-700
+                                     text-xs font-bold flex items-center justify-center mt-0.5">
+                      {i + 1}
+                    </span>
+                    <span>
+                      <span className="font-medium">{item.owner || "Unassigned"}</span>
+                      {": "}
+                      {item.task}
+                      {item.due && item.due !== "TBD" && (
+                        <span className="text-gray-400 ml-1">(by {item.due})</span>
+                      )}
+                    </span>
+                  </li>
+                ))}
+              </ol>
+            </SectionCard>
+          )}
+        </>)}
+
+        {/* ════════════════════════════════════════════════════════════════
+            ACTION ITEMS ONLY
+        ════════════════════════════════════════════════════════════════ */}
+        {outputType === "action_items" && (
+          <SectionCard
+            title={`Action Items${result.action_items?.length ? ` (${result.action_items.length})` : ""}`}
+            icon={<span className="text-teal-600 text-base">✅</span>}
+          >
+            <ActionItemsTable items={result.action_items} incomplete={incomplete} />
           </SectionCard>
         )}
 
