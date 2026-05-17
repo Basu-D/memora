@@ -32,6 +32,8 @@ RUN mkdir -p /app/data/uploads /app/data/jobs /app/data/db
 # Expose the API port (informational; actual binding is via CMD / compose)
 EXPOSE 8000
 
-# Default: run the FastAPI server.
-# The Celery worker overrides this with `command:` in docker-compose.
-CMD ["python", "main.py"]
+# Default: run both FastAPI server and Celery worker together.
+# The Celery worker override in docker-compose still works for local dev.
+COPY start.sh .
+RUN chmod +x start.sh
+CMD ["./start.sh"]

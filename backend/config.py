@@ -28,6 +28,14 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
     database_url: str = "sqlite:///./memora.db"
 
+    @property
+    def db_url(self) -> str:
+        # SQLAlchemy 2.x requires 'postgresql://' but Railway emits 'postgres://'
+        url = self.database_url
+        if url.startswith("postgres://"):
+            url = "postgresql://" + url[len("postgres://"):]
+        return url
+
     # Storage
     upload_dir: str = "uploads"
     jobs_dir: str = "jobs"          # transcript.json and extracted audio live here
