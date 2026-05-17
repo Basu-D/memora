@@ -34,4 +34,4 @@ EXPOSE 8000
 
 # Default: run the FastAPI server.
 # The Celery worker overrides this with `command:` in docker-compose.
-CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1
+CMD ["/bin/sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1"]
