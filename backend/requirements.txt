@@ -12,6 +12,7 @@ redis==5.2.0
 
 # Database
 sqlalchemy==2.0.36
+psycopg2-binary==2.9.10
 
 # AI — transcription (cloud API, no local model)
 openai>=1.52.0
