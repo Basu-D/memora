@@ -93,6 +93,8 @@ services:
         VITE_API_BASE_URL: ""
         VITE_API_KEY: ${ORG_API_KEY:-changeme}
     restart: unless-stopped
+    environment:
+      BACKEND_URL: http://backend:8000
     ports:
       - "3000:80"            # app available at http://localhost:3000
     depends_on:

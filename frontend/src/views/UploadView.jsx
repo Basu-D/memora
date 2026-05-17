@@ -305,7 +305,6 @@ export default function UploadView({ onJobCreated }) {
   const [urlError,  setUrlError]  = useState(null);
 
   // ── shared state ────────────────────────────────────────────────────────
-  const [title,                  setTitle]                  = useState("");
   const [outputType,             setOutputType]             = useState("detailed");
   const [publishToConfluence,    setPublishToConfluence]    = useState(true);
   const [customInstructions,     setCustomInstructions]     = useState("");
@@ -322,7 +321,6 @@ export default function UploadView({ onJobCreated }) {
   const [pagesLoading,        setPagesLoading]        = useState(false);
   const [selectedParentPage,  setSelectedParentPage]  = useState(null);  // {id, title}
   const [pageTitle,           setPageTitle]           = useState("");
-  const [pageTitleTouched,    setPageTitleTouched]    = useState(false);
 
   // ── §4.3 Context input ──────────────────────────────────────────────────
   const [showContext,          setShowContext]          = useState(false);
@@ -347,11 +345,6 @@ export default function UploadView({ onJobCreated }) {
       setPublishToConfluence(shouldPublish);
     }
   }, []);
-
-  // ── Sync page title with meeting title (if not manually touched) ────────
-  useEffect(() => {
-    if (!pageTitleTouched) setPageTitle(title);
-  }, [title, pageTitleTouched]);
 
   // ── Fetch Confluence spaces when publish is toggled on ──────────────────
   const fetchSpaces = useCallback(() => {
@@ -415,10 +408,6 @@ export default function UploadView({ onJobCreated }) {
     setFile(picked);
     setFileError(null);
     setSubmitErr(null);
-    setTitle((t) => {
-      if (t.trim()) return t;
-      return picked.name.replace(/\.[^.]+$/, "").replace(/[-_]/g, " ");
-    });
   }, []);
 
   function handleInputChange(e) { pickFile(e.target.files?.[0]); e.target.value = ""; }
@@ -434,7 +423,7 @@ export default function UploadView({ onJobCreated }) {
     const confluenceDest = publishToConfluence ? {
       space_key:      selectedSpace?.key || "",
       parent_page_id: selectedParentPage?.id || "",
-      page_title:     pageTitle.trim() || title.trim() || "",
+      page_title:     pageTitle.trim(),
     } : {};
 
     if (mode === "file") {
@@ -443,7 +432,7 @@ export default function UploadView({ onJobCreated }) {
       setSubmitErr(null);
       try {
         const { job_id } = await uploadMeeting(
-          file, title, outputType, publishToConfluence,
+          file, "", outputType, publishToConfluence,
           customInstructions, confluenceDest, contextText, contextReferenceUrl,
         );
         updatePrefsAfterSubmit({ outputType, publishToConfluence, selectedSpace, selectedParentPage });
@@ -463,7 +452,7 @@ export default function UploadView({ onJobCreated }) {
       setSubmitErr(null);
       try {
         const { job_id } = await submitUrlMeeting(
-          trimmed, title, outputType, publishToConfluence,
+          trimmed, "", outputType, publishToConfluence,
           customInstructions, confluenceDest, contextText, contextReferenceUrl,
         );
         updatePrefsAfterSubmit({ outputType, publishToConfluence, selectedSpace, selectedParentPage });
@@ -613,22 +602,6 @@ export default function UploadView({ onJobCreated }) {
           </div>
         )}
 
-        {/* Meeting title (shared) */}
-        <div className="flex flex-col gap-1.5">
-          <label htmlFor="meeting-title" className="text-sm font-medium text-gray-700">
-            Meeting title <span className="text-gray-400 font-normal">(optional)</span>
-          </label>
-          <input
-            id="meeting-title"
-            type="text"
-            value={title}
-            onChange={(e) => setTitle(e.target.value)}
-            placeholder="e.g. Sprint 42 Review"
-            maxLength={200}
-            className={inputCls}
-          />
-        </div>
-
         {/* Output type */}
         <div className="flex flex-col gap-1.5">
           <label htmlFor="output-type" className="text-sm font-medium text-gray-700">
@@ -714,15 +687,20 @@ export default function UploadView({ onJobCreated }) {
 
             {/* Page title */}
             <div className="flex flex-col gap-1.5">
-              <label className="text-xs font-medium text-gray-600">Page title</label>
+              <label className="text-xs font-medium text-gray-600">
+                Page title <span className="text-gray-400 font-normal">(optional)</span>
+              </label>
               <input
                 type="text"
                 value={pageTitle}
-                onChange={(e) => { setPageTitle(e.target.value); setPageTitleTouched(true); }}
-                placeholder={title || "Meeting Notes"}
+                onChange={(e) => setPageTitle(e.target.value)}
+                placeholder="Auto-generated from content"
                 maxLength={512}
                 className={inputCls}
               />
+              <p className="text-xs text-gray-400">
+                Leave blank and the agent will pick a title from the meeting content.
+              </p>
             </div>
           </div>
         )}
