@@ -32,13 +32,11 @@ FROM nginx:alpine
 # Copy the Vite production build
 COPY --from=builder /app/dist /usr/share/nginx/html
 
-# Replace the default nginx config with ours (includes /api/ proxy + SPA fallback)
-COPY nginx.conf /etc/nginx/conf.d/default.conf
+# Copy nginx config as a template — PORT is substituted at container startup
+COPY nginx.conf /etc/nginx/conf.d/default.conf.template
 
-# Remove the default nginx config to avoid conflicts
-RUN rm -f /etc/nginx/conf.d/default.conf.bak 2>/dev/null; exit 0
+# Default port for local/docker-compose use; Railway overrides this with its own PORT
+ENV PORT=80
 
-# nginx listens on 80; docker-compose maps this to the host port (3000)
-EXPOSE 80
-
-CMD ["nginx", "-g", "daemon off;"]
+# Substitute $PORT into the nginx config then start nginx
+CMD ["/bin/sh", "-c", "envsubst '$PORT' < /etc/nginx/conf.d/default.conf.template > /etc/nginx/conf.d/default.conf && exec nginx -g 'daemon off;'"]
