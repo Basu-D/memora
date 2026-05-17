@@ -71,17 +71,16 @@ _TOOLS = genai.protos.Tool(
         ),
         genai.protos.FunctionDeclaration(
             name="create_confluence_page",
-            description="Create a new Confluence page with the prepared meeting documentation.",
+            description=(
+                "Create a new Confluence page with the prepared meeting documentation. "
+                "The page body is managed by the system — do NOT include it in args."
+            ),
             parameters=genai.protos.Schema(
                 type=genai.protos.Type.OBJECT,
                 properties={
                     "title": genai.protos.Schema(
                         type=genai.protos.Type.STRING,
                         description="Page title.",
-                    ),
-                    "body": genai.protos.Schema(
-                        type=genai.protos.Type.STRING,
-                        description="Full page body in Confluence Storage Format.",
                     ),
                     "space_key": genai.protos.Schema(
                         type=genai.protos.Type.STRING,
@@ -92,12 +91,15 @@ _TOOLS = genai.protos.Tool(
                         description="Parent page ID, or empty string for a top-level page.",
                     ),
                 },
-                required=["title", "body", "space_key"],
+                required=["title", "space_key"],
             ),
         ),
         genai.protos.FunctionDeclaration(
             name="update_confluence_page",
-            description="Update an existing Confluence page with new meeting documentation.",
+            description=(
+                "Update an existing Confluence page with new meeting documentation. "
+                "The page body is managed by the system — do NOT include it in args."
+            ),
             parameters=genai.protos.Schema(
                 type=genai.protos.Type.OBJECT,
                 properties={
@@ -109,12 +111,8 @@ _TOOLS = genai.protos.Tool(
                         type=genai.protos.Type.STRING,
                         description="Updated page title.",
                     ),
-                    "body": genai.protos.Schema(
-                        type=genai.protos.Type.STRING,
-                        description="New full page body in Confluence Storage Format.",
-                    ),
                 },
-                required=["page_id", "title", "body"],
+                required=["page_id", "title"],
             ),
         ),
         genai.protos.FunctionDeclaration(
@@ -488,7 +486,18 @@ class MeetingAgent:
                     )
                 )
 
-            response = chat.send_message(response_parts)
+            try:
+                response = chat.send_message(response_parts)
+            except genai.types.StopCandidateException as exc:
+                # Gemini 2.5 Flash sometimes emits MALFORMED_FUNCTION_CALL when
+                # asked to generate large structured arguments (e.g. Confluence XML).
+                # If we already created/updated the page this turn, treat it as done.
+                # Otherwise, surface the error so the job is marked FAILED.
+                logger.warning("[%s] StopCandidateException on turn %d: %s", job_id, turn, exc)
+                if ctx.confluence_url:
+                    logger.info("[%s] Page already actioned — ignoring exception", job_id)
+                    return ctx
+                raise
         else:
             logger.warning("[%s] Tool loop hit MAX_TOOL_TURNS (%d)", job_id, MAX_TOOL_TURNS)
 
@@ -511,7 +520,7 @@ class MeetingAgent:
         if name == "create_confluence_page":
             result = self._tool_create_confluence_page(
                 title=args.get("title", ""),
-                body=args.get("body", ""),
+                body="",  # always overridden by self._pre_rendered_body
                 space_key=args.get("space_key") or self._dest_space_key,
                 parent_id=args.get("parent_id") or self._dest_parent_page_id or None,
             )
@@ -524,7 +533,7 @@ class MeetingAgent:
             result = self._tool_update_confluence_page(
                 page_id=args.get("page_id", ""),
                 title=args.get("title", ""),
-                body=args.get("body", ""),
+                body="",  # always overridden by self._pre_rendered_body
             )
             ctx.page_id = result.get("page_id", "")
             ctx.confluence_url = result.get("url", "")
