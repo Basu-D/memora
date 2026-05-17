@@ -9,10 +9,9 @@ const ACCEPTED_ACCEPT      = ACCEPTED_EXTENSIONS.join(",");
 const MAX_BYTES            = 500 * 1024 * 1024; // 500 MB
 
 const OUTPUT_TYPES = [
-  { value: "detailed",      label: "Detailed Document",   description: "Full notes: summary, decisions, action items, open questions and highlights." },
-  { value: "mom",           label: "Minutes of Meeting",  description: "Formal MoM: agenda items discussed, decisions made, action items, next steps." },
-  { value: "quick_summary", label: "Quick Summary",       description: "3–5 bullet points covering what was discussed, decided, and who owns what." },
-  { value: "action_items",  label: "Action Items Only",   description: "Just the action items table: owner, task, and deadline." },
+  { value: "quick_summary", label: "Quick Summary",      description: "3–5 bullets on what was discussed, decided, and who owns what." },
+  { value: "mom",           label: "Minutes of Meeting", description: "Formal record: agenda items, decisions made, action items, and next steps." },
+  { value: "detailed",      label: "Detailed Document",  description: "Full notes: summary, decisions, action items, open questions, and highlights." },
 ];
 
 const CONFLUENCE_ON_BY_DEFAULT = new Set(["detailed", "mom"]);
@@ -293,7 +292,7 @@ function ParentPageSelect({ pages, recentPages, selectedPage, onSelect, loading 
 // ---------------------------------------------------------------------------
 
 export default function UploadView({ onJobCreated }) {
-  const [mode,      setMode]      = useState("file"); // "file" | "url"
+  const [mode,      setMode]      = useState("url"); // "file" | "url"
 
   // ── file mode ───────────────────────────────────────────────────────────
   const [file,      setFile]      = useState(null);
@@ -305,7 +304,7 @@ export default function UploadView({ onJobCreated }) {
   const [urlError,  setUrlError]  = useState(null);
 
   // ── shared state ────────────────────────────────────────────────────────
-  const [outputType,             setOutputType]             = useState("detailed");
+  const [outputType,             setOutputType]             = useState("quick_summary");
   const [publishToConfluence,    setPublishToConfluence]    = useState(true);
   const [customInstructions,     setCustomInstructions]     = useState("");
   const [showCustomInstructions, setShowCustomInstructions] = useState(false);
@@ -341,7 +340,7 @@ export default function UploadView({ onJobCreated }) {
     if (conf) {
       const shouldPublish = conf.create_page_default !== undefined
         ? conf.create_page_default
-        : CONFLUENCE_ON_BY_DEFAULT.has(prefs.output_type || "detailed");
+        : CONFLUENCE_ON_BY_DEFAULT.has(prefs.output_type || "quick_summary");
       setPublishToConfluence(shouldPublish);
     }
   }, []);
@@ -489,8 +488,8 @@ export default function UploadView({ onJobCreated }) {
         {/* Mode toggle */}
         <div className="flex rounded-xl border border-gray-200 bg-gray-100 p-1 gap-1">
           {[
-            { key: "file", icon: <UploadCloudIcon className="w-4 h-4" />, label: "Upload File" },
-            { key: "url",  icon: <LinkIcon className="w-4 h-4" />,         label: "Paste URL" },
+            { key: "url",  icon: <LinkIcon className="w-4 h-4" />,          label: "Paste URL" },
+            { key: "file", icon: <UploadCloudIcon className="w-4 h-4" />,  label: "Upload File" },
           ].map(({ key, icon, label }) => (
             <button
               key={key}
@@ -605,7 +604,7 @@ export default function UploadView({ onJobCreated }) {
         {/* Output type */}
         <div className="flex flex-col gap-1.5">
           <label htmlFor="output-type" className="text-sm font-medium text-gray-700">
-            Output type
+            What should we create?
           </label>
           <select
             id="output-type"
