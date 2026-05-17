@@ -37,6 +37,8 @@ COPY nginx.conf /etc/nginx/conf.d/default.conf.template
 
 # Default port for local/docker-compose use; Railway overrides this with its own PORT
 ENV PORT=80
+# Default backend URL for docker-compose; Railway/prod overrides with the actual backend service URL
+ENV BACKEND_URL=http://backend:8000
 
 # Substitute $PORT into the nginx config then start nginx
 CMD ["/bin/sh", "-c", "envsubst '$PORT $BACKEND_URL' < /etc/nginx/conf.d/default.conf.template > /etc/nginx/conf.d/default.conf && exec nginx -g 'daemon off;'"]
