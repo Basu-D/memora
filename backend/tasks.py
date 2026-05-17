@@ -9,7 +9,12 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
+import sys
 from pathlib import Path
+
+# Ensure the app directory is on sys.path when the worker starts from a
+# different working directory (e.g. Railway without PYTHONPATH=/app set).
+sys.path.insert(0, str(Path(__file__).parent))
 
 from celery import Celery
 from celery.utils.log import get_task_logger
