@@ -4,9 +4,8 @@ All modules import from here — never read os.environ directly elsewhere.
 """
 
 import json
-from typing import Any
 
-from pydantic import field_validator
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -38,18 +37,19 @@ class Settings(BaseSettings):
     mock_agent: bool = False           # skip Gemini API; return stub extraction + skip Confluence
 
 
-    # CORS — accepts JSON array or comma-separated string
-    cors_origins: list[str] = ["http://localhost:5173", "http://localhost:80"]
+    # CORS — accepts JSON array ('["url1","url2"]') or comma-separated ("url1,url2").
+    # Typed as str so pydantic-settings v2 never tries to JSON-parse it automatically.
+    cors_origins_raw: str = Field(
+        default="http://localhost:5173,http://localhost:80",
+        validation_alias="CORS_ORIGINS",
+    )
 
-    @field_validator("cors_origins", mode="before")
-    @classmethod
-    def parse_cors_origins(cls, v: Any) -> Any:
-        if isinstance(v, str):
-            v = v.strip()
-            if v.startswith("["):
-                return json.loads(v)
-            return [o.strip() for o in v.split(",") if o.strip()]
-        return v
+    @property
+    def cors_origins(self) -> list[str]:
+        v = self.cors_origins_raw.strip()
+        if v.startswith("["):
+            return json.loads(v)
+        return [o.strip() for o in v.split(",") if o.strip()]
 
 
 settings = Settings()
