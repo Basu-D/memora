@@ -295,12 +295,17 @@ export default function ProcessingView({ jobId, onDone, onReset }) {
                         >
                           {step.label}
                         </span>
+                        {stepState === "active" && (
+                          <span className="hidden sm:block text-xs text-teal-600 font-medium animate-pulse">
+                            {step.description}
+                          </span>
+                        )}
                         {stepState === "done" && (
                           <span className="text-xs text-teal-500">Done</span>
                         )}
                       </div>
                       {stepState === "active" && (
-                        <span className="text-xs text-teal-600 font-medium animate-pulse mt-0.5 block">
+                        <span className="sm:hidden text-xs text-teal-600 font-medium animate-pulse mt-0.5 block">
                           {step.description}
                         </span>
                       )}
