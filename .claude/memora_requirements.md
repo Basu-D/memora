@@ -8,7 +8,7 @@
 
 Memora converts meeting recordings into structured, permanent documentation.
 It was built to solve two real problems inside an engineering organisation:
-1. Meeting recordings expire after 30 days (Webex policy) — Memora preserves the content forever.
+1. Meeting recordings expire after certain days (Organisation/Webex policy) — Memora preserves the content forever.
 2. People don't watch long recordings — Memora converts them into readable, structured documents.
 
 The app is being built for real internal use within our team and eventually
@@ -492,6 +492,10 @@ These architectural decisions are intentional. Do not simplify or remove them:
   `PublicDownloader`, `TokenDownloader`, `OAuthDownloader` implementations.
   Auth mode is selected via `RECORDING_AUTH_MODE` env var. No code changes
   required when switching auth modes — only env var changes.
+- **space_index.py** must be a separate module. Handles all index
+  building, refreshing, and tree operations. `agent.py` calls
+  `space_index.get_or_build(space_key)` only — never calls Confluence
+  APIs for structure directly.
 - **confluence.py** page builder must be a separate module, not inlined in tasks.
 - All AI prompt templates must be in a separate `prompts.py` file,
   not hardcoded inside agent.py or tasks.py.
