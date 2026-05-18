@@ -138,7 +138,7 @@ class ConfluenceClient:
                     {
                         "id": r["id"],
                         "title": r["title"],
-                        "url": self._page_url(r["id"]),
+                        "url": self._page_url(r),
                     }
                     for r in results
                 ]
@@ -184,6 +184,15 @@ class ConfluenceClient:
         url = f"{self.base_url}/rest/api/content"
         with httpx.Client(timeout=30) as client:
             response = client.post(url, json=payload, headers=self._headers)
+            if response.status_code == 400 and "already exists" in response.text.lower():
+                # Page exists with this title — find it and update instead.
+                logger.warning(
+                    "create_page: duplicate title %r in space %r — falling back to update",
+                    title, space_key or self.space_key,
+                )
+                existing = self.search_pages(title, limit=1)
+                if existing:
+                    return self.update_page(existing[0]["id"], title, body)
             if not response.is_success:
                 logger.error(
                     "create_page failed %s — title=%r space=%r parent=%r body_len=%d — response: %s",

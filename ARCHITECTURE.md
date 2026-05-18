@@ -2,7 +2,7 @@
 
 ## What it does
 
-Memora converts meeting recordings into structured Confluence pages. You give it a file or a URL; it transcribes the audio with Whisper, extracts decisions/action items/attendees with Gemini, and publishes a formatted page to Confluence.
+Memora converts meeting recordings into structured Confluence pages. You give it a file or a URL; it transcribes the audio with OpenAI Whisper, extracts decisions/action items/attendees with Gemini, and publishes a formatted page to Confluence.
 
 ---
 
@@ -20,52 +20,61 @@ Browser (React SPA)
 ┌─────────────────────┐         ┌────────────────────────┐
 │  FastAPI backend    │──task──▶│  Celery worker          │
 │  (port 8000)        │         │  (same Docker image,    │
-│                     │◀──DB────│   different CMD)        │
+│                     │◀──DB────│   start.sh runs both)   │
 └──────────┬──────────┘         └───────────┬────────────┘
            │                                │
            ▼                                ▼
-┌──────────────────┐            ┌────────────────────────┐
-│  SQLite (jobs DB)│            │  Redis (task queue +   │
-│  /app/data/db/   │            │  result backend)       │
-└──────────────────┘            └────────────────────────┘
+┌──────────────────────┐        ┌────────────────────────┐
+│  PostgreSQL (jobs DB)│        │  Redis (task queue +   │
+│  Railway managed     │        │  result backend)       │
+└──────────────────────┘        └────────────────────────┘
 ```
 
-Four Docker services:
+### Railway deployment (production)
 
-| Service | Image | Purpose |
-|---|---|---|
-| `redis` | `redis:alpine` | Celery broker and result store |
-| `backend` | custom Python | FastAPI API server |
-| `worker` | same custom Python | Celery worker that does the heavy processing |
-| `frontend` | custom nginx | Serves the React SPA; proxies `/api/*` to backend |
+Five Railway services:
 
-All persistent data (uploads, transcripts, results, the SQLite DB) lives in a single named volume `app_data` mounted into both `backend` and `worker`, so they share the same files.
+| Service | Purpose |
+|---|---|
+| `backend` | FastAPI API server + Celery worker (single service via `start.sh`) |
+| `frontend` | Nginx serving the React SPA; proxies `/api/*` to backend |
+| `redis` | Railway managed Redis plugin — Celery broker and result store |
+| `postgres` | Railway managed PostgreSQL plugin — job database |
+
+`start.sh` launches `celery worker` in the background then `exec uvicorn` as PID 1. Both processes share the same container filesystem, so uploaded files and job artifacts are accessible to both without a shared volume.
+
+The backend service has one persistent volume mounted at `/app/data/uploads` for uploaded recordings. Job artifacts (audio, transcripts) are written to `/app/data/jobs/`.
+
+### Local development (docker-compose)
+
+Four Docker services: `redis`, `backend`, `worker` (separate container, same image), `frontend`. A single named volume `app_data` is mounted into both `backend` and `worker` so they share files and the SQLite database.
 
 ---
 
 ## Data flow for a single job
 
 ```
-1. User uploads file or pastes URL
+1. User submits file or URL + options (output type, Confluence destination, etc.)
    → POST /upload  or  POST /upload-url
-   → Job row created in SQLite (status: uploaded)
+   → Job row created in PostgreSQL (status: uploaded)
    → process_recording.delay(job_id) queued in Redis
 
 2. Celery worker picks up the task
    Step 0 (URL jobs only):
-     yt-dlp downloads the file → status: downloading
+     RecordingDownloader.download() via yt-dlp → status: downloading
    Step 1:
-     ffmpeg converts to 16 kHz mono WAV → status: extracting_audio
+     ffmpeg converts to 16 kHz mono MP3 (64 kbps) → status: extracting_audio
    Step 2:
-     Whisper large-v3 transcribes → writes transcript.json → status: transcribing
+     OpenAI Whisper API (whisper-1) transcribes → writes transcript.json → status: transcribing
    Step 3 (agent):
-     Gemini Phase 1: JSON extraction (title, decisions, action items, …)
-     Gemini Phase 2: Confluence tool loop (search → create/update → flag)
+     Gemini Phase 1: structured JSON extraction (title, decisions, action items, …)
+     Gemini Phase 2: Confluence tool loop (search → create/update → flag incomplete items)
      → writes result.json → status: done (or failed at any step)
 
 3. Frontend polls GET /status/{job_id} every 2 s
    → switches to ResultView when status == "done"
    → shows error when status == "failed"
+   → user can download a .docx via GET /jobs/{job_id}/download
 ```
 
 ---
@@ -76,32 +85,33 @@ All persistent data (uploads, transcripts, results, the SQLite DB) lives in a si
 
 **Class: `Settings(BaseSettings)`**
 
-Single source of truth for every environment variable the app reads. All other modules import from `config.settings`; none read `os.environ` directly.
+Single source of truth for every environment variable. All modules import from `config.settings`.
 
 ```
 gemini_api_key      → GEMINI_API_KEY
+openai_api_key      → OPENAI_API_KEY       (Whisper API)
 confluence_url      → CONFLUENCE_URL
-confluence_token    → CONFLUENCE_TOKEN
-confluence_space_key→ CONFLUENCE_SPACE_KEY
+confluence_email    → CONFLUENCE_EMAIL     (Atlassian account email for Basic auth)
+confluence_token    → CONFLUENCE_TOKEN     (Atlassian API token)
 org_api_key         → ORG_API_KEY          (shared secret for X-API-Key auth)
 redis_url           → REDIS_URL
-database_url        → DATABASE_URL
-upload_dir          → UPLOAD_DIR           (where uploaded files are saved)
-jobs_dir            → JOBS_DIR             (where transcript.json / result.json live)
-cors_origins        → CORS_ORIGINS         (JSON list, e.g. ["http://localhost:5173"])
+database_url        → DATABASE_URL         (PostgreSQL in prod; SQLite locally)
+upload_dir          → UPLOAD_DIR
+jobs_dir            → JOBS_DIR
+cors_origins        → CORS_ORIGINS         (JSON array or comma-separated)
+mock_transcription  → MOCK_TRANSCRIPTION   (dev: skip OpenAI, return stub)
+mock_agent          → MOCK_AGENT           (dev: skip Gemini + Confluence)
 ```
 
-Values come from the `.env` file at startup. Docker Compose passes them as environment variables which override `.env` defaults (e.g. overriding SQLite path to a volume mount).
+**`db_url` property:** Normalises Railway's `postgres://` scheme to `postgresql://` which SQLAlchemy 2.x requires. Always use `settings.db_url` (not `settings.database_url`) when constructing the engine.
 
-**Why pydantic-settings?** Type-checking and `.env` parsing in one place. The `cors_origins: list[str]` field requires the value to be valid JSON in the `.env` file (`["a","b"]` not `a,b`).
+**`cors_origins` property:** Accepts either a JSON array (`["url1","url2"]`) or comma-separated string (`url1,url2`).
 
 ---
 
 ### `database.py` — Data model & CRUD
 
 **Enum: `JobStatus`**
-
-Represents every state a job can be in:
 
 ```
 uploaded → downloading → extracting_audio → transcribing → processing → publishing → done
@@ -118,22 +128,25 @@ One row per submitted recording. Key columns:
 |---|---|
 | `id` | UUID primary key |
 | `filename` | Display name shown in the UI |
-| `storage_path` | Filename inside `uploads/` (e.g. `abc123.mp4`) |
+| `storage_path` | Filename inside `uploads/` (null for URL jobs until download) |
 | `source_url` | Set for URL jobs; null for file uploads |
 | `status` | Current `JobStatus` |
+| `output_type` | `detailed` \| `mom` \| `quick_summary` \| `action_items` |
+| `publish_to_confluence` | Boolean — whether to publish at all |
+| `custom_instructions` | Free-text appended to the extraction prompt |
+| `confluence_space_key` | Target Confluence space (per-job) |
+| `confluence_parent_page_id` | Optional parent page ID |
+| `confluence_page_title` | Optional explicit page title override |
+| `context_text` | Optional meeting context injected into the prompt |
+| `confluence_reference_url` | Optional reference URL embedded in the page |
+| `screenshots_enabled` | Boolean stub for future screenshot capture |
 | `error_message` | Non-null only when `status == failed` |
 | `confluence_url` | URL of the published Confluence page |
 | `result_json` | Full extraction result as JSON text |
 
-**Why SQLite?** Zero-infrastructure for local/self-hosted deploy. Switching to PostgreSQL requires only changing `DATABASE_URL` — the `connect_args` guard in `create_engine` removes the SQLite-specific flag automatically.
+**Database choice:** PostgreSQL in production (Railway plugin). SQLite supported for local development — only `DATABASE_URL` needs to change. The `connect_args` guard in `create_engine` and the `db_url` normaliser in `config.py` handle both transparently.
 
-**Functions**
-
-- `create_job(db, filename, storage_path, source_url)` — inserts a new row
-- `get_job(db, job_id)` — fetches by UUID; raises `ValueError` if not found
-- `update_job_status(db, job_id, status, ...)` — transitions status and optionally sets result fields
-- `get_db()` — FastAPI dependency that yields a session and closes it in `finally`
-- `init_db()` — called at API startup; creates tables and runs a safe `ALTER TABLE` migration to add `source_url` to existing databases
+**`init_db()`** — called at API startup. Runs `Base.metadata.create_all()` then a safe `ALTER TABLE` migration list (idempotent — each statement is silently skipped if the column already exists).
 
 ---
 
@@ -141,39 +154,53 @@ One row per submitted recording. Key columns:
 
 **Class: `APIKeyMiddleware(BaseHTTPMiddleware)`**
 
-Every request must carry `X-API-Key: <value>` matching `ORG_API_KEY`. The `/health`, `/docs`, and `/openapi.json` endpoints are exempt (used by Docker health probes and Swagger UI).
+Every request must carry `X-API-Key: <value>` matching `ORG_API_KEY`. Exempt paths: `/health`, `/docs`, `/openapi.json`. Returns 401 (missing) or 403 (wrong key). The frontend sends the key via `VITE_API_KEY`, baked into the React bundle at build time.
 
-Returns 401 (missing header) or 403 (wrong key). The frontend sends the key via `VITE_API_KEY`, baked into the React bundle at build time.
-
-**Why middleware instead of a FastAPI dependency?** Middleware runs before routing, so it catches all routes uniformly including ones added later. The comment at the bottom of the file describes exactly how to swap it for an OIDC/JWT middleware when the org moves to SSO.
+The `GET /jobs/{job_id}/download` endpoint also accepts `?api_key=` as a query param because it is opened via a browser anchor click (no header injection possible from `<a href>`).
 
 ---
 
 ### `main.py` — FastAPI routes
 
-Four routes:
+**`POST /upload`** — file upload  
+Validates extension (`.mp4 .mp3 .webm .wav .m4a`) and MIME type. Streams to disk in 256 KB chunks, enforcing a 500 MB cap. Accepts all job options as form fields (output_type, confluence destination, custom instructions, etc.). Creates a `Job` row and queues the task.
 
-**`POST /upload`** — file upload
-- Validates extension and MIME type
-- Streams the file to disk in 256 KB chunks, enforcing a 500 MB cap
-- Creates a `Job` row with `storage_path` set
-- Queues `process_recording.delay(job.id)`
-- Returns `{job_id, status}` immediately (202)
+**`POST /upload-url`** — URL submission  
+Accepts a JSON body with `url` plus the same job options. Validates `http`/`https` scheme. The actual download happens inside the worker.
 
-**`POST /upload-url`** — URL submission
-- Validates scheme is `http` or `https`
-- Creates a `Job` row with `source_url` set (no `storage_path` yet)
-- Queues `process_recording.delay(job.id)`
-- Returns `{job_id, status}` immediately (202)
-- The actual download happens inside the worker (Step 0)
+**`GET /status/{job_id}`** — job polling  
+Returns current status, filename, timestamps, and `error_message`. Frontend polls every 2 s.
 
-**`GET /status/{job_id}`** — job polling
-- Returns current status, filename, timestamps, and `error_message` if failed
-- Frontend polls this every 2 seconds
+**`GET /result/{job_id}`** — completed result  
+Returns 409 if not done yet. Returns full result JSON and `confluence_url` when done.
 
-**`GET /result/{job_id}`** — completed result
-- Returns 409 if still processing
-- Returns full result JSON when `status == done`
+**`GET /jobs/{job_id}/download`** — DOCX export  
+Generates a `.docx` from `result_json` using `python-docx` and streams it. Format depends on `output_type` — each type has its own section layout.
+
+**`GET /confluence/spaces`** — Confluence space list  
+Calls `ConfluenceClient.get_spaces()` and returns `[{key, name}]` for the destination picker in the UI.
+
+**`GET /confluence/pages?space_key=`** — Confluence page list  
+Returns `[{id, title}]` for the parent page picker.
+
+---
+
+### `recording_downloader.py` — Download abstraction
+
+**Class hierarchy:**
+
+```
+RecordingDownloader (ABC)
+  ├─ PublicDownloader   — yt-dlp, no auth (RECORDING_AUTH_MODE=none, default)
+  ├─ TokenDownloader    — static Bearer token (RECORDING_AUTH_MODE=token, TODO)
+  └─ OAuthDownloader    — per-user OAuth (RECORDING_AUTH_MODE=oauth, TODO)
+```
+
+**`get_downloader()`** — factory that reads `RECORDING_AUTH_MODE` and returns the right implementation. `tasks.py` calls only this function; adding a new auth mode requires no changes to `tasks.py`.
+
+`PublicDownloader` uses yt-dlp with: prefer m4a audio, 2 GB max, 30 s socket timeout, 3 retries. After download, resolves the actual filename via `prepare_filename` (extension can change after yt-dlp post-processing), falling back to globbing `{job_id}.*`.
+
+`_friendly_download_error()` maps raw yt-dlp exception strings to user-readable messages (bot detection, private video, geo-restriction, format unavailable, network error, etc.).
 
 ---
 
@@ -181,62 +208,27 @@ Four routes:
 
 **Function: `process_recording(job_id)`** (the Celery task)
 
-This is the entire processing pipeline in one function. It runs sequentially in the Celery worker process.
-
 ```
 Load job from DB
   │
-  ├─ storage_path is None AND source_url set?
-  │    └─ Step 0: _download_from_url()    → status: DOWNLOADING
+  ├─ source_url set and no storage_path?
+  │    └─ Step 0: get_downloader().download()    → status: DOWNLOADING
   │
-  ├─ Step 1: _extract_audio()             → status: EXTRACTING_AUDIO
-  │    ffmpeg converts to 16 kHz mono WAV
+  ├─ Step 1: _extract_audio()                    → status: EXTRACTING_AUDIO
+  │    ffmpeg: input → 16 kHz mono MP3 @ 64 kbps
+  │    Raises RuntimeError if output > 24 MB (Whisper API limit)
   │
-  ├─ Step 2: _transcribe()                → status: TRANSCRIBING
-  │    Whisper large-v3 → transcript.json
-  │    then:                              → status: PROCESSING
+  ├─ Step 2: _transcribe()                       → status: TRANSCRIBING
+  │    OpenAI whisper-1 API → transcript.json    → status: PROCESSING
   │
-  └─ Step 3: run_agent(job_id)            (agent.py sets PUBLISHING → DONE)
+  └─ Step 3: run_agent(job_id)                   (agent.py sets PUBLISHING → DONE)
 ```
 
-Each step is wrapped in `try/except`. Any failure calls `_mark_failed_new_session()` and returns — the job is marked `FAILED` with a descriptive message and the pipeline stops.
+Each step is wrapped in `try/except`. Any failure calls `_mark_failed_new_session()` and returns early — the job is marked `FAILED` with a descriptive error message.
 
-**Function: `_download_from_url(url, job_id, upload_dir)`**
+**Audio size limit:** If the extracted MP3 exceeds 24 MB (≈50 min of audio at 64 kbps), the job fails with a user-readable message asking to split the recording. No chunking is implemented.
 
-Uses yt-dlp to download from any supported URL (direct file, Zoom, Vimeo, YouTube, etc.). Key options:
-
-- `format`: prefers m4a audio, falls back progressively to any video
-- `max_filesize`: 2 GB hard cap
-- `socket_timeout`: 30 s — prevents infinite hangs on stalled connections
-- `retries`: 3 retries on transient network errors
-
-After download, uses `ydl.prepare_filename(info)` to find the actual filename yt-dlp wrote (extension can change after post-processing). Falls back to globbing `{job_id}.*` if the file has been renamed.
-
-**Function: `_extract_audio(source, job_dir)`**
-
-Runs `ffmpeg -i <source> -vn -acodec pcm_s16le -ar 16000 -ac 1 audio.wav`. Always re-encodes even `.wav` inputs to ensure Whisper gets exactly 16 kHz mono PCM. 10-minute timeout.
-
-**Function: `_get_whisper_model()`**
-
-Loads `whisper.load_model("large-v3")` once per worker process and caches it in a module-level variable. The model is ~3 GB and takes ~30 s to load; this means only the first task in each worker pays the load cost.
-
-**Function: `_transcribe(audio_path, job_dir, job_id)`**
-
-Runs Whisper on the WAV file. Writes `transcript.json`:
-
-```json
-{
-  "full_text": "...",
-  "segments": [{"start": 0.0, "end": 5.2, "text": "..."}],
-  "language": "en"
-}
-```
-
-**Function: `_friendly_download_error(raw)`**
-
-Maps raw yt-dlp error strings to human-readable messages. Handles: YouTube bot detection, private videos, geo-restrictions, unsupported format, extractor bugs, network errors.
-
-**Why one Celery task (not a chain)?** The steps share state (paths, the DB session) and need sequential error handling. A chain would require passing paths between tasks and makes the failure-handling pattern more complex for little benefit at this scale.
+**Celery config:** `task_acks_late=True`, `task_reject_on_worker_lost=True` — tasks survive worker crashes and are re-queued. No `autoretry_for` — these are long-running operations where retrying immediately is unlikely to help.
 
 ---
 
@@ -244,11 +236,11 @@ Maps raw yt-dlp error strings to human-readable messages. Handles: YouTube bot d
 
 **Class: `MeetingAgent`**
 
-Runs two sequential Gemini calls ("phases") to go from transcript text to a published Confluence page.
+Runs two sequential Gemini calls.
 
 **Phase 1 — Structured extraction**
 
-Uses `gemini-2.5-flash` in JSON response mode (`response_mime_type="application/json"`, `temperature=0`). Sends the full transcript with a prompt that asks for a specific JSON shape:
+`gemini-2.5-flash`, JSON response mode (`response_mime_type="application/json"`, `temperature=0`). Returns:
 
 ```json
 {
@@ -263,49 +255,72 @@ Uses `gemini-2.5-flash` in JSON response mode (`response_mime_type="application/
 }
 ```
 
-Falls back to empty defaults if JSON parsing fails (so Phase 2 still runs and writes a stub page rather than crashing the job).
+Falls back to empty defaults if JSON parsing fails so Phase 2 still runs.
 
 **Phase 2 — Confluence tool loop**
 
-Uses the same model with 4 function-calling tools declared as `genai.protos.FunctionDeclaration`:
+`gemini-2.5-flash` with 4 function-calling tools:
 
-| Tool | What it does |
-|---|---|
-| `search_confluence` | CQL search for pages similar to the meeting title |
-| `create_confluence_page` | POST new page in the configured space |
-| `update_confluence_page` | PUT update of an existing page (auto-increments version) |
-| `flag_incomplete_action_items` | Filter action items missing owner or due date |
+| Tool | Args | What it does |
+|---|---|---|
+| `search_confluence` | `query` | CQL title search in the target space |
+| `create_confluence_page` | `title`, `space_key`, `parent_id` | POST new page |
+| `update_confluence_page` | `page_id`, `title` | PUT existing page (auto-increments version) |
+| `flag_incomplete_action_items` | `action_items` | Returns items missing owner or due date |
 
-The agent sends the rendered page body (in Confluence Storage Format) and instructs Gemini to: search first, then create or update, then flag incomplete action items. The loop runs until Gemini stops calling tools or hits `MAX_TOOL_TURNS = 10`.
+**Important:** `body` is intentionally absent from `create_confluence_page` and `update_confluence_page`. Gemini generating Confluence Storage Format XML inline in a function call argument causes `MALFORMED_FUNCTION_CALL` errors. The agent always uses `self._pre_rendered_body` (rendered by `prompts.py` before Phase 2 starts) — whatever body Gemini might supply is ignored.
 
-**Template renderers** (`_render_sprint_review`, `_render_planning`, `_render_incident`, `_render_general`)
+A `StopCandidateException` with `MALFORMED_FUNCTION_CALL` is caught in the tool loop. If the page was already actioned (created/updated) by that turn, the exception is swallowed and the result is returned normally.
 
-Each produces an XHTML string in Confluence Storage Format. Chosen by `meeting_type`. The incident template adds a `<ac:structured-macro ac:name="warning">` block for visibility. All use `html.escape()` to prevent injection.
+**Template selection:** Based on `meeting_type` from Phase 1 — one Confluence Storage Format template per type (`sprint-review`, `planning`, `incident`, `general`). Templates live in `prompts.py`. The incident template adds a `<ac:structured-macro ac:name="warning">` block.
 
-**Function: `run_agent(job_id)`** (public entry point)
+---
 
-Called by `tasks.process_recording`. Reads `transcript.json`, runs the agent, writes `result.json`, updates the DB to `DONE`.
+### `prompts.py` — AI prompts and Confluence templates
+
+Contains:
+- `SYSTEM_PROMPT` — Gemini system instruction
+- `EXTRACTION_PROMPT` — Phase 1 prompt template (slots: `{transcript}`, `{custom_instructions}`)
+- `TEMPLATE_MAP` — dict mapping `meeting_type → render function`
+- `build_extraction_prompt()`, `build_action_prompt()` — prompt builders called by `agent.py`
+- `render_confluence_body()` — entry point that picks and calls the right template renderer
+- Per-type renderer functions that produce Confluence Storage Format XHTML (all values escaped with `html.escape()`)
 
 ---
 
 ### `confluence.py` — Confluence API client
 
-**Dataclass: `MeetingDocument`**
-
-A plain Python dataclass holding all the structured data extracted by Phase 1. Passed to the template renderers.
-
 **Class: `ConfluenceClient`**
 
-Thin synchronous wrapper around the Confluence REST API (v1 content endpoints). Uses `httpx.Client` for all HTTP calls (sync is fine inside Celery workers).
+Authentication: **HTTP Basic** (`Authorization: Basic base64(email:api_token)`) — required for Confluence Cloud. Bearer token auth is only for Confluence Data Center PATs.
 
 | Method | Endpoint | Purpose |
 |---|---|---|
-| `search_pages(query, limit)` | `GET /rest/api/content/search` | CQL search by title in the configured space |
-| `create_page(title, body, ...)` | `POST /rest/api/content` | Create a new page |
-| `update_page(page_id, title, body)` | `PUT /rest/api/content/{id}` | Update existing page |
-| `_get_page_version(page_id)` | `GET /rest/api/content/{id}?expand=version` | Fetch current version before updating (Confluence requires the exact current version number) |
+| `get_spaces(limit)` | `GET /rest/api/space` | List accessible spaces for destination picker |
+| `get_pages(space_key, limit)` | `GET /rest/api/content` | List pages in a space for parent picker |
+| `search_pages(query, limit)` | `GET /rest/api/content/search` | CQL title search; returns empty list on failure (non-fatal) |
+| `create_page(title, body, space_key, parent_id)` | `POST /rest/api/content` | Create new page |
+| `update_page(page_id, title, body)` | `PUT /rest/api/content/{id}` | Update existing page (fetches current version first) |
 
-Authentication uses a `Bearer` token in the `Authorization` header. `search_pages` swallows exceptions and returns an empty list — a search failure is non-fatal; the agent will just create a new page.
+---
+
+### `storage.py` — Storage abstraction (stub)
+
+**Class hierarchy:**
+
+```
+StorageBackend (ABC)
+  └─ LocalStorage   — filesystem under upload_dir (current default)
+  (S3Storage — TODO: implement with boto3)
+```
+
+`get_storage()` factory returns `LocalStorage` today. Swap to `S3Storage` by reading a `STORAGE_BACKEND` env var here — no callers need to change.
+
+---
+
+### `start.sh` — Combined process launcher (Railway)
+
+Runs `celery worker --concurrency=2` in the background then `exec uvicorn` as PID 1. Used as the Railway backend service CMD. Railway's health checks and shutdown signals target uvicorn (PID 1); if uvicorn exits, the container restarts, which also restarts celery.
 
 ---
 
@@ -313,59 +328,58 @@ Authentication uses a `Bearer` token in the `Authorization` header. `search_page
 
 ### `src/api.js`
 
-All HTTP calls to the backend. Two functions for job submission:
+All HTTP calls to the backend. `apiFetch` helper injects `X-API-Key` (from `VITE_API_KEY`) and the base URL.
 
-- `uploadMeeting(file, title)` — multipart/form-data POST to `/upload`
-- `submitUrlMeeting(url, title)` — JSON POST to `/upload-url`
-
-Both use a shared `apiFetch` helper that injects the `X-API-Key` header (from `VITE_API_KEY`) and the correct base URL.
+- `uploadMeeting(file, options)` — multipart/form-data POST to `/upload`
+- `submitUrlMeeting(url, options)` — JSON POST to `/upload-url`
+- `pollStatus(job_id)` — GET `/status/{job_id}`
+- `fetchResult(job_id)` — GET `/result/{job_id}`
+- `fetchSpaces()` / `fetchPages(spaceKey)` — GET `/confluence/spaces` and `/confluence/pages`
 
 ### `src/views/UploadView.jsx`
 
-The landing page. Two modes controlled by `mode` state (`"file"` | `"url"`):
-
-- **File mode**: drag-and-drop zone with extension + size validation
-- **URL mode**: text input with `http://`/`https://` client-side check
-
-Both modes share a "Meeting title" field and submit to their respective API call. Switches to `ProcessingView` on success via `onJobCreated(job_id)`.
+Landing page with two modes (`file` | `url`). Includes:
+- Output type selector (Detailed Notes / MOM / Quick Summary / Action Items Only)
+- Confluence destination picker (space + optional parent page, loaded from API)
+- Optional: custom instructions, context text, reference URL, screenshots toggle
 
 ### `src/views/ProcessingView.jsx`
 
-Polls `GET /status/{job_id}` every 2 seconds. Shows an animated stepper with one row per pipeline step:
+Polls `/status/{job_id}` every 2 s. Animated stepper:
 
 ```
 Downloading → Extracting Audio → Transcribing → AI Processing → Publishing
 ```
 
-Each step has a `StepProgressBar` that uses `requestAnimationFrame` to animate smoothly toward 90% while active (exponential ease: `90 * (1 - e^(-t/estSeconds))`), then snaps to 100% when the step completes. Steps that finish instantly (e.g. `downloading` for file uploads) jump through without showing the bar.
-
-On `failed`: shows the `error_message` from the API with a "Start over" button.
+Each active step shows a `StepProgressBar` (exponential ease toward 90%, snaps to 100% on completion) and a description subtitle. The subtitle is **inline on desktop** (≥640 px) and **below the label on mobile** (<640 px) to avoid text overlap.
 
 ### `src/views/ResultView.jsx`
 
-Displays the completed result fetched from `GET /result/{job_id}`: title, summary, attendees, decisions, action items, open questions, and a link to the Confluence page.
+Displays completed result (title, summary, attendees, decisions, action items, open questions) and a link to the Confluence page. Includes a "Download .docx" button that calls `GET /jobs/{job_id}/download`.
 
 ---
 
 ## Key design decisions
 
-**Why Celery + Redis instead of async background tasks?**
-Whisper large-v3 takes minutes of CPU time. FastAPI's `BackgroundTasks` runs in the same process and would block the event loop. Celery pushes heavy work to a separate process and survives server restarts — the task is still in Redis if the backend restarts mid-job.
+**Why Celery + Redis instead of async background tasks?**  
+Transcription takes minutes. FastAPI `BackgroundTasks` runs in the same process and would block. Celery isolates heavy work in a separate process and survives server restarts — the task stays in Redis if the backend restarts mid-job.
 
-**Why SQLite?**
-No external database needed for self-hosted deploys. The `DATABASE_URL` env var is the only thing that changes when moving to PostgreSQL. The SQLite-specific `connect_args` is already conditional on the URL prefix.
+**Why remove `body` from Confluence tool schemas?**  
+Gemini 2.5 Flash's thinking mode generates `MALFORMED_FUNCTION_CALL` when asked to produce large Confluence Storage Format XML inline in a function argument. Since the agent always uses `self._pre_rendered_body` anyway (Gemini's body is ignored to prevent XML corruption), removing the argument from the schema eliminates the failure surface entirely.
 
-**Why store everything in one `Job` row?**
-Simplicity. `result_json` is a denormalized JSON blob — no joins needed to fetch a complete result. At the scale Memora targets (one team, tens of jobs per day), this is fine.
+**Why two separate Gemini phases?**  
+Phase 1 uses JSON response mode with `temperature=0` for deterministic structured output. Phase 2 uses function calling for real-world actions. Mixing them in one call makes both worse — the model can't simultaneously produce constrained JSON and reason about tool sequencing.
 
-**Why two separate Gemini calls (two-phase)?**
-Phase 1 uses JSON response mode with `temperature=0` for deterministic structured output — function calling is not ideal here because the model would have to call a tool to return data that the code directly consumes. Phase 2 uses function calling to take real actions (Confluence API). Mixing these in one call makes both worse.
+**Why PostgreSQL in production / SQLite locally?**  
+Railway isolates services in separate containers with no shared filesystem. SQLite can't be shared across two containers, so PostgreSQL (Railway plugin) is required. Locally, SQLite is zero-infrastructure. Only `DATABASE_URL` changes — the `db_url` normaliser and `connect_args` guard handle both.
 
-**Why one Celery task for the full pipeline?**
-The steps share file paths and need linear error handling. A Celery chain would require passing state between tasks and complicates the failure path. The entire pipeline for one recording is a single unit of work.
+**Why one Celery task for the full pipeline?**  
+Steps share file paths and need linear error handling. A Celery chain would require passing paths between tasks and complicates the failure path.
 
 **How to scale**
-- More concurrent recordings: increase `--concurrency` on the worker, or run more worker replicas. Each worker loads Whisper once on first use.
-- More reliability: replace SQLite with PostgreSQL and Redis with a managed equivalent.
-- Authentication: swap `APIKeyMiddleware` in `main.py` for an OIDC middleware — the routes don't change.
-- Storage: add S3 support in `storage.py` (already stubbed) and write `_download_to_s3` / `_upload_path_from_s3`.
+
+- **Concurrency:** Increase `--concurrency` on the worker or run more worker instances. Each process pays the Whisper/Gemini API latency independently.
+- **Storage:** Implement `S3Storage` in `storage.py` and set `STORAGE_BACKEND=s3` — no other code changes needed.
+- **Download auth:** Add a new `RecordingDownloader` subclass in `recording_downloader.py` and handle it in `get_downloader()` — `tasks.py` needs no changes.
+- **Authentication:** Swap `APIKeyMiddleware` in `main.py` for an OIDC middleware — routes are unaffected.
+- **Database:** Already on PostgreSQL in production. For higher load, point `DATABASE_URL` at a larger Railway Postgres plan or an external managed DB.

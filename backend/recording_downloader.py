@@ -58,13 +58,22 @@ class RecordingDownloader(ABC):
 # PublicDownloader — unauthenticated, yt-dlp backed (current default)
 # ---------------------------------------------------------------------------
 
+def youtube_cookies_file() -> str | None:
+    """Return the path to a YouTube cookies file if configured and readable."""
+    path = os.getenv("YOUTUBE_COOKIES_FILE", "").strip()
+    if path and Path(path).is_file():
+        return path
+    return None
+
+
 class PublicDownloader(RecordingDownloader):
     """
     Downloads recordings from public URLs using yt-dlp.
 
     Handles direct file links (.mp4, .mp3, .webm …) as well as platform
-    URLs that yt-dlp supports (YouTube, Vimeo, Zoom cloud recordings, etc.).
-    No authentication is performed — the URL must be publicly accessible.
+    URLs that yt-dlp supports (Vimeo, Zoom cloud recordings, etc.).
+    YouTube is supported only when YOUTUBE_COOKIES_FILE points to a valid
+    Netscape-format cookies.txt — otherwise the API layer rejects those URLs.
     """
 
     def download(self, url: str, job_id: str, destination_dir: Path) -> Path:
@@ -82,6 +91,11 @@ class PublicDownloader(RecordingDownloader):
             "no_warnings": False,
             "noprogress": True,
         }
+
+        cookies = youtube_cookies_file()
+        if cookies:
+            ydl_opts["cookiefile"] = cookies
+            logger.debug("[%s] Using YouTube cookies file: %s", job_id, cookies)
 
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
