@@ -23,7 +23,6 @@ from auth import APIKeyMiddleware
 from config import settings
 from confluence import ConfluenceClient
 from database import JobStatus, create_job, get_db, get_job, init_db, update_job_status
-from recording_downloader import youtube_cookies_file
 from tasks import process_recording
 
 logging.basicConfig(level=logging.INFO)
@@ -245,25 +244,13 @@ async def upload_from_url(
     returns immediately.  Poll /status/{job_id} for progress.
 
     Supported sources: any URL yt-dlp can handle — direct file links,
-    Zoom cloud recordings, Vimeo. YouTube is supported only when
-    YOUTUBE_COOKIES_FILE is configured on the server.
+    Zoom cloud recordings, Vimeo, YouTube, etc.
     """
     parsed = urlparse(body.url)
     if parsed.scheme not in ("http", "https"):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="URL must use http or https.",
-        )
-
-    _YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "youtu.be", "m.youtube.com"}
-    if parsed.hostname in _YOUTUBE_HOSTS and not youtube_cookies_file():
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=(
-                "YouTube links are not supported — the server cannot download them without "
-                "browser authentication. Use a direct file URL (.mp4 / .mp3), a Vimeo link, "
-                "or a Zoom/Google Drive direct download link instead."
-            ),
         )
 
     # Derive a human-readable display name from the URL path.

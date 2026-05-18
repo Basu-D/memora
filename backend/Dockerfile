@@ -8,10 +8,12 @@ FROM python:3.11-slim
 # System dependencies
 #   ffmpeg  — audio extraction / transcoding
 #   curl    — used by docker-compose healthcheck
+#   nodejs  — JS runtime for yt-dlp (YouTube web-client fallback)
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         ffmpeg \
         curl \
+        nodejs \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
