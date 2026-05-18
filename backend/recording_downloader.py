@@ -90,6 +90,9 @@ class PublicDownloader(RecordingDownloader):
             "quiet": True,
             "no_warnings": False,
             "noprogress": True,
+            # ios/android clients use YouTube's mobile API — no bot check, no JS needed.
+            # web is kept as last-resort fallback (covered by nodejs in the Dockerfile).
+            "extractor_args": {"youtube": {"player_client": ["ios", "android", "web"]}},
         }
 
         cookies = youtube_cookies_file()
