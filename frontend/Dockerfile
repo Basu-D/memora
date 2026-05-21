@@ -41,4 +41,4 @@ ENV PORT=80
 ENV BACKEND_URL=http://backend:8000
 
 # Substitute $PORT into the nginx config then start nginx
-CMD ["/bin/sh", "-c", "export NGINX_RESOLVER=$(awk '/^nameserver/ && $2 ~ /^[0-9]/{print $2; exit}' /etc/resolv.conf); export NGINX_RESOLVER=${NGINX_RESOLVER:-8.8.8.8} && envsubst '$PORT $BACKEND_URL $NGINX_RESOLVER' < /etc/nginx/conf.d/default.conf.template > /etc/nginx/conf.d/default.conf && exec nginx -g 'daemon off;'"]
+CMD ["/bin/sh", "-c", "NS=$(awk '/^nameserver/{print $2; exit}' /etc/resolv.conf); case $NS in *:*) NS=\"[$NS]\";; esac; export NGINX_RESOLVER=$NS && envsubst '$PORT $BACKEND_URL $NGINX_RESOLVER' < /etc/nginx/conf.d/default.conf.template > /etc/nginx/conf.d/default.conf && exec nginx -g 'daemon off;'"]
