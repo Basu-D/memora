@@ -56,6 +56,12 @@ class ConfluenceClient:
         self.base_url = (base_url or settings.confluence_url).rstrip("/")
         self.space_key = space_key or ""
 
+        if not self.base_url:
+            raise ValueError(
+                "CONFLUENCE_URL is not configured. "
+                "Set CONFLUENCE_URL, CONFLUENCE_EMAIL, and CONFLUENCE_TOKEN environment variables."
+            )
+
         # Confluence Cloud uses HTTP Basic auth: base64(email:api_token).
         # Bearer auth is only for Confluence Data Center PATs.
         _email = email or settings.confluence_email
