@@ -35,7 +35,7 @@ Do not include markdown fences — return raw JSON only.
 
 Required fields:
 {{
-  "meeting_type": "<one of: sprint-review | planning | incident | general>",
+  "meeting_type": "<one of: sprint-review | sprint-planning | sprint-retrospective | pi-planning | pi-retrospective | backlog-refinement | standup | planning | incident | post-mortem | one-on-one | design-review | architecture-review | stakeholder-update | kick-off | general>",
   "title": "<concise page title, include date if mentioned>",
   "attendees": ["<name>", ...],
   "summary": "<2–4 sentence meeting summary>",
@@ -69,7 +69,7 @@ Do not include markdown fences — return raw JSON only.
 
 Required fields:
 {{
-  "meeting_type": "<one of: sprint-review | planning | incident | general>",
+  "meeting_type": "<one of: sprint-review | sprint-planning | sprint-retrospective | pi-planning | pi-retrospective | backlog-refinement | standup | planning | incident | post-mortem | one-on-one | design-review | architecture-review | stakeholder-update | kick-off | general>",
   "title": "<formal meeting title, include date if mentioned>",
   "date": "<YYYY-MM-DD if mentioned in the transcript, else empty string>",
   "attendees": ["<name>", ...],
@@ -344,11 +344,54 @@ def render_general(d: MeetingDocument) -> str:
 """.strip()
 
 
+def render_retrospective(d: MeetingDocument) -> str:
+    # Field repurposing for retro context:
+    #   highlights     → What Went Well
+    #   open_questions → What Could Be Improved
+    #   decisions      → Agreed Improvements
+    return f"""
+<h2>Retrospective Summary</h2>
+<p>{_e(d.summary)}</p>
+
+<h2>Attendees</h2>
+<p>{_e(', '.join(d.attendees)) if d.attendees else '<em>Not recorded.</em>'}</p>
+
+<h2>What Went Well</h2>
+{_ul(d.highlights)}
+
+<h2>What Could Be Improved</h2>
+{_ul(d.open_questions)}
+
+<h2>Agreed Improvements</h2>
+{_ul(d.decisions)}
+
+<h2>Action Items</h2>
+{_action_table(d.action_items)}
+""".strip()
+
+
 TEMPLATE_MAP: dict[str, Any] = {
-    "sprint-review": render_sprint_review,
-    "planning":      render_planning,
-    "incident":      render_incident,
-    "general":       render_general,
+    # original
+    "sprint-review":       render_sprint_review,
+    "planning":            render_planning,
+    "incident":            render_incident,
+    "general":             render_general,
+    # planning-family
+    "sprint-planning":     render_planning,
+    "pi-planning":         render_planning,
+    "kick-off":            render_planning,
+    # retrospective-family (field meanings differ — use dedicated renderer)
+    "sprint-retrospective": render_retrospective,
+    "pi-retrospective":    render_retrospective,
+    # post-mortem shares incident structure
+    "post-mortem":         render_incident,
+    # general-family
+    "standup":             render_general,
+    "backlog-refinement":  render_general,
+    "one-on-one":          render_general,
+    "design-review":       render_general,
+    "architecture-review": render_general,
+    "stakeholder-update":  render_general,
 }
 
 
@@ -420,4 +463,5 @@ def render_confluence_body(output_type: str, extracted: dict, meeting_type: str 
         open_questions=extracted.get("open_questions") or [],
         highlights=extracted.get("highlights") or [],
     )
-    return TEMPLATE_MAP[meeting_type](document)
+    renderer = TEMPLATE_MAP.get(meeting_type, render_general)
+    return renderer(document)

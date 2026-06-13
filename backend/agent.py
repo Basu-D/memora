@@ -45,13 +45,36 @@ from prompts import (
 logger = logging.getLogger(__name__)
 
 MAX_TOOL_TURNS = 10      # hard cap on tool-call rounds per job
-MEETING_TYPES = frozenset({"sprint-review", "planning", "incident", "general"})
+MEETING_TYPES = frozenset({
+    # original
+    "sprint-review", "planning", "incident", "general",
+    # new
+    "sprint-planning", "sprint-retrospective",
+    "pi-planning", "pi-retrospective",
+    "backlog-refinement", "standup",
+    "one-on-one", "design-review", "architecture-review",
+    "post-mortem", "stakeholder-update", "kick-off",
+})
 
 _MEETING_TYPE_LABELS: dict[str, str] = {
-    "sprint-review": "Sprint Review",
-    "planning":      "Planning",
-    "incident":      "Incident",
-    "general":       "General Meeting",
+    # original
+    "sprint-review":       "Sprint Review",
+    "planning":            "Planning",
+    "incident":            "Incident",
+    "general":             "General Meeting",
+    # new
+    "sprint-planning":     "Sprint Planning",
+    "sprint-retrospective": "Sprint Retrospective",
+    "standup":             "Standup / Daily Scrum",
+    "pi-planning":         "PI Planning",
+    "pi-retrospective":    "PI Retrospective",
+    "backlog-refinement":  "Backlog Refinement",
+    "one-on-one":          "1:1 Meeting",
+    "design-review":       "Design Review",
+    "architecture-review": "Architecture Review",
+    "post-mortem":         "Post-Mortem",
+    "stakeholder-update":  "Stakeholder Update",
+    "kick-off":            "Project Kick-off",
 }
 
 # ---------------------------------------------------------------------------
