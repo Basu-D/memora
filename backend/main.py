@@ -85,6 +85,24 @@ async def health() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Session
+# ---------------------------------------------------------------------------
+
+@app.get("/session", tags=["auth"])
+async def create_session() -> JSONResponse:
+    """
+    Issue a short-lived signed session token for browser clients.
+
+    The token is HMAC-signed with ORG_API_KEY and expires after 24 hours.
+    The frontend calls this once on load and includes the token via the
+    X-Session-Token header — the actual ORG_API_KEY never reaches the browser.
+    """
+    from auth import _sign_session
+    token = _sign_session(settings.org_api_key)
+    return JSONResponse(content={"token": token})
+
+
+# ---------------------------------------------------------------------------
 # Confluence destination helpers
 # ---------------------------------------------------------------------------
 

@@ -3,11 +3,11 @@
  *
  * Environment variables (set in .env or passed as Vite build args):
  *   VITE_API_BASE_URL  — backend origin, e.g. http://localhost:8000
- *   VITE_API_KEY       — value of ORG_API_KEY
  *
- * In development the Vite dev-server proxy forwards /upload, /status, /result,
- * /jobs to localhost:8000, so BASE_URL is effectively empty and API_KEY is
- * still sent via the X-API-Key header.
+ * Authentication: on module load, /api/session is called once to obtain a
+ * short-lived signed session token. The token is kept in memory (never
+ * compiled into the bundle) and injected into every subsequent request via
+ * the X-Session-Token header.
  */
 
 // In Docker, VITE_API_BASE_URL is "" and nginx proxies /api/* to the backend.
@@ -15,20 +15,59 @@
 // dev-server proxy forwards /api/* to http://localhost:8000.
 // All paths in this file therefore start with /api/.
 const BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? "").replace(/\/$/, "");
-const API_KEY  = import.meta.env.VITE_API_KEY ?? "";
 
 // Prefix for every backend route — must match the nginx location block.
 const API_ROOT = `${BASE_URL}/api`;
 
+// ---------------------------------------------------------------------------
+// Session management
+// ---------------------------------------------------------------------------
+
+let _sessionToken = null;
+let _sessionPromise = null;
+
 /**
- * Core fetch wrapper — injects auth header and throws a descriptive Error on
- * any non-2xx response.  `detail` from FastAPI JSON error bodies is surfaced.
+ * Fetch (or return the in-flight fetch of) a session token from the server.
+ * Invoked automatically before every API request.
+ */
+function _ensureSession() {
+  if (_sessionToken) return Promise.resolve(_sessionToken);
+  if (!_sessionPromise) {
+    _sessionPromise = fetch(`${API_ROOT}/session`)
+      .then((r) => r.json())
+      .then((data) => {
+        _sessionToken = data.token ?? null;
+        return _sessionToken;
+      })
+      .catch(() => {
+        _sessionPromise = null; // allow retry on next request
+        return null;
+      });
+  }
+  return _sessionPromise;
+}
+
+// Kick off the session fetch immediately so it's ready when the first
+// real API call arrives.
+_ensureSession();
+
+// ---------------------------------------------------------------------------
+// Core fetch wrapper
+// ---------------------------------------------------------------------------
+
+/**
+ * Core fetch wrapper — injects the session token and throws a descriptive
+ * Error on any non-2xx response. `detail` from FastAPI JSON error bodies
+ * is surfaced.
  */
 async function apiFetch(path, options = {}) {
+  const token = await _ensureSession();
+  const authHeader = token ? { "X-Session-Token": token } : {};
+
   const response = await fetch(`${API_ROOT}${path}`, {
     ...options,
     headers: {
-      "X-API-Key": API_KEY,
+      ...authHeader,
       ...options.headers,
     },
   });
@@ -208,13 +247,11 @@ export async function getJobResult(jobId) {
 
 /**
  * Return the URL for downloading the .docx for a completed job.
- * The API key is included as a query param because this URL is used as an
- * anchor href — the browser navigates directly to it.
- *
- * TODO: replace with a short-lived signed URL or a session-cookie endpoint
- * to avoid exposing the API key in the URL / browser history.
+ * The session token is passed as a query param because this URL is used as
+ * an anchor href — the browser navigates directly to it without custom headers.
+ * The token is short-lived (24 h) and is never compiled into the JS bundle.
  */
 export function getDownloadUrl(jobId) {
-  const key = encodeURIComponent(API_KEY);
-  return `${API_ROOT}/jobs/${jobId}/download${key ? `?api_key=${key}` : ""}`;
+  const token = _sessionToken;
+  return `${API_ROOT}/jobs/${jobId}/download${token ? `?session_token=${encodeURIComponent(token)}` : ""}`;
 }
