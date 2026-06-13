@@ -242,6 +242,23 @@ export async function getJobResult(jobId) {
 }
 
 // ---------------------------------------------------------------------------
+// Publish retry
+// ---------------------------------------------------------------------------
+
+/**
+ * Re-queue Confluence publishing for a job that completed with publish_failed=true.
+ * Poll getJobStatus until status returns to "done", then call getJobResult for
+ * the updated result (which will have publish_failed=false on success).
+ *
+ * @param {string} jobId
+ * @returns {Promise<{job_id: string, status: string}>}
+ */
+export async function retryPublish(jobId) {
+  const response = await apiFetch(`/jobs/${jobId}/retry-publish`, { method: "POST" });
+  return response.json();
+}
+
+// ---------------------------------------------------------------------------
 // Download
 // ---------------------------------------------------------------------------
 

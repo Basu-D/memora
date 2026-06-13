@@ -385,11 +385,50 @@ async def job_result(job_id: str, db: Session = Depends(get_db)) -> JSONResponse
         result_data = None
 
     return JSONResponse(content={
-        "job_id": job.id,
-        "status": job.status.value,
+        "job_id":         job.id,
+        "status":         job.status.value,
         "confluence_url": job.confluence_url,
-        "result": result_data,
+        "result":         result_data,
+        "publish_failed": bool(job.publish_failed),
     })
+
+
+# ---------------------------------------------------------------------------
+# POST /jobs/{job_id}/retry-publish
+# ---------------------------------------------------------------------------
+
+@app.post("/jobs/{job_id}/retry-publish", status_code=status.HTTP_202_ACCEPTED, tags=["jobs"])
+async def retry_publish_endpoint(job_id: str, db: Session = Depends(get_db)) -> JSONResponse:
+    """
+    Re-queue Confluence publishing for a completed job where publish_failed=True.
+
+    Sets status → PUBLISHING and clears publish_failed before queuing the task,
+    so a second click while the retry is in-flight returns 409 instead of
+    creating a duplicate task.
+    """
+    try:
+        job = get_job(db, job_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Job not found.")
+
+    if job.status == JobStatus.PUBLISHING:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Publish already in progress.")
+
+    if job.status != JobStatus.DONE:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Can only retry a completed job.")
+
+    if not job.publish_failed:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Confluence publish did not fail for this job.")
+
+    update_job_status(db, job_id, JobStatus.PUBLISHING, publish_failed=False)
+
+    from tasks import retry_confluence_publish
+    retry_confluence_publish.delay(job_id)
+
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED,
+        content={"job_id": job_id, "status": "retrying"},
+    )
 
 
 # ---------------------------------------------------------------------------

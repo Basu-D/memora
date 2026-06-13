@@ -354,6 +354,72 @@ def _transcribe(audio_path: Path, job_dir: Path, job_id: str) -> Path:
 
 
 # ---------------------------------------------------------------------------
+# Retry publish task
+# ---------------------------------------------------------------------------
+
+@celery_app.task(bind=True, name="tasks.retry_confluence_publish")
+def retry_confluence_publish(self, job_id: str) -> None:
+    """
+    Re-attempt Confluence publishing for a DONE job with publish_failed=True.
+
+    On success: clears publish_failed and sets confluence_url.
+    On failure: restores publish_failed=True so the user can retry again.
+    """
+    from database import JobStatus, SessionLocal, get_job, update_job_status
+
+    db = SessionLocal()
+    try:
+        job = get_job(db, job_id)
+        result_json_str        = job.result_json
+        confluence_space_key   = job.confluence_space_key or ""
+        confluence_parent_id   = job.confluence_parent_page_id or ""
+    except Exception as exc:
+        logger.error("[%s] retry_confluence_publish: failed to load job: %s", job_id, exc)
+        return
+    finally:
+        db.close()
+
+    if not result_json_str:
+        logger.error("[%s] retry_confluence_publish: no result_json to publish", job_id)
+        return
+
+    try:
+        result = json.loads(result_json_str)
+    except json.JSONDecodeError:
+        logger.error("[%s] retry_confluence_publish: corrupt result_json", job_id)
+        return
+
+    try:
+        from agent import retry_publish
+        pub = retry_publish(job_id, result, confluence_space_key, confluence_parent_id)
+
+        result["confluence_url"] = pub["confluence_url"]
+        result["page_action"]    = pub["page_action"]
+        updated_json = json.dumps(result, ensure_ascii=False)
+
+        db = SessionLocal()
+        try:
+            update_job_status(
+                db, job_id, JobStatus.DONE,
+                confluence_url=pub["confluence_url"],
+                result_json=updated_json,
+                publish_failed=False,
+            )
+        finally:
+            db.close()
+
+        logger.info("[%s] Retry publish succeeded: %s", job_id, pub["confluence_url"])
+
+    except Exception as exc:
+        logger.exception("[%s] Retry publish failed", job_id)
+        db = SessionLocal()
+        try:
+            update_job_status(db, job_id, JobStatus.DONE, publish_failed=True)
+        finally:
+            db.close()
+
+
+# ---------------------------------------------------------------------------
 # Failure helper
 # ---------------------------------------------------------------------------
 

@@ -73,6 +73,7 @@ class Job(Base):
     error_message = Column(Text, nullable=True)
     confluence_url = Column(String(2048), nullable=True)
     result_json = Column(Text, nullable=True)
+    publish_failed = Column(Boolean, nullable=False, default=False)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -138,6 +139,7 @@ def update_job_status(
     error_message: str | None = None,
     confluence_url: str | None = None,
     result_json: str | None = None,
+    publish_failed: bool | None = None,
 ) -> Job:
     """
     Transition a job to a new status and optionally set result fields.
@@ -167,6 +169,8 @@ def update_job_status(
         job.confluence_url = confluence_url
     if result_json is not None:
         job.result_json = result_json
+    if publish_failed is not None:
+        job.publish_failed = publish_failed
 
     db.commit()
     db.refresh(job)
@@ -224,6 +228,8 @@ def init_db() -> None:
         "ALTER TABLE jobs ADD COLUMN confluence_reference_url VARCHAR(2048)",
         # §4.4 — screenshot stub
         "ALTER TABLE jobs ADD COLUMN screenshots_enabled BOOLEAN NOT NULL DEFAULT 0",
+        # publish_failed — set when Confluence publish fails but extraction succeeded
+        "ALTER TABLE jobs ADD COLUMN publish_failed BOOLEAN NOT NULL DEFAULT 0",
     ]
     with engine.connect() as conn:
         for sql in _migrations:

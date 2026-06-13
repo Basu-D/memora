@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { getJobResult, getDownloadUrl } from "../api.js";
+import { getJobResult, getJobStatus, getDownloadUrl, retryPublish } from "../api.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -215,9 +215,11 @@ function DecisionsSection({ decisions }) {
 // ---------------------------------------------------------------------------
 
 export default function ResultView({ jobId, onReset }) {
-  const [data,    setData]    = useState(null);
-  const [loading, setLoading] = useState(true);
-  const [error,   setError]   = useState(null);
+  const [data,       setData]       = useState(null);
+  const [loading,    setLoading]    = useState(true);
+  const [error,      setError]      = useState(null);
+  const [retrying,   setRetrying]   = useState(false);
+  const [retryError, setRetryError] = useState(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -226,6 +228,27 @@ export default function ResultView({ jobId, onReset }) {
       .catch((err) => { if (!cancelled) { setError(err.message); setLoading(false); } });
     return () => { cancelled = true; };
   }, [jobId]);
+
+  async function handleRetry() {
+    setRetrying(true);
+    setRetryError(null);
+    try {
+      await retryPublish(jobId);
+      // Poll until the worker finishes (status leaves PUBLISHING → DONE)
+      const deadline = Date.now() + 120_000; // 2-minute timeout
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 3000));
+        const s = await getJobStatus(jobId);
+        if (s.status === "done" || s.status === "failed") break;
+      }
+      const fresh = await getJobResult(jobId);
+      setData(fresh);
+    } catch (err) {
+      setRetryError(err.message);
+    } finally {
+      setRetrying(false);
+    }
+  }
 
   // ── loading ──────────────────────────────────────────────────────────────
   if (loading) {
@@ -337,6 +360,36 @@ export default function ResultView({ jobId, onReset }) {
                 <code className="font-mono">false</code> in <code className="font-mono">backend/.env</code> to process real recordings.
               </p>
             </div>
+          </div>
+        )}
+
+        {/* ── Confluence publish-failed banner ─────────────────────────── */}
+        {data?.publish_failed && (
+          <div className="flex items-start gap-3 rounded-xl bg-yellow-50 border border-yellow-300 px-5 py-4">
+            <WarningIcon className="w-5 h-5 text-yellow-500 shrink-0 mt-0.5" />
+            <div className="flex-1 min-w-0">
+              <p className="text-sm font-semibold text-yellow-800">
+                Document created but Confluence publishing failed — you can still download the .docx
+              </p>
+              {retryError && (
+                <p className="text-xs text-red-600 mt-1">{retryError}</p>
+              )}
+            </div>
+            <button
+              onClick={handleRetry}
+              disabled={retrying}
+              className="shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium
+                         bg-yellow-100 hover:bg-yellow-200 text-yellow-800 transition-colors disabled:opacity-60"
+            >
+              {retrying ? (
+                <>
+                  <SpinnerIcon className="w-3 h-3 animate-spin" />
+                  Retrying…
+                </>
+              ) : (
+                "Retry"
+              )}
+            </button>
           </div>
         )}
 

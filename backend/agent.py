@@ -195,40 +195,49 @@ class MeetingAgent:
         )
 
     # ------------------------------------------------------------------
-    # Public entry point
+    # Public entry points (two-phase: extract then publish)
     # ------------------------------------------------------------------
 
-    def run(
+    def extract(
         self,
         transcript: str,
         job_id: str,
         output_type: str = "detailed",
-        publish_to_confluence: bool = True,
         custom_instructions: str = "",
-        confluence_destination: dict | None = None,
         context_text: str = "",
+        confluence_destination: dict | None = None,
     ) -> dict[str, Any]:
         """
-        Execute the full two-phase pipeline.
+        Phase 1 — structured extraction only.
+
+        Runs Gemini extraction and returns the full result dict with an empty
+        confluence_url.  Stores the pre-rendered page body and publish title on
+        self so that publish() can be called immediately after without re-running
+        extraction.
 
         Args:
             transcript: Plain-text transcript (output of Whisper).
             job_id: Used only for logging context.
             output_type: Controls extraction schema and page format.
-            publish_to_confluence: When False, Phase 2 is skipped entirely.
+            custom_instructions: Optional extra guidance for Gemini.
+            context_text: Optional background context passed to Gemini.
             confluence_destination: {space_key, parent_page_id, page_title} from job.
-            context_text: Optional background context passed to Gemini extraction.
 
         Returns:
-            Result dict suitable for writing to result.json.
+            Result dict suitable for immediate storage (confluence_url will be "").
         """
         if settings.mock_agent:
-            logger.info("[%s] MOCK agent — output_type=%s publish=%s", job_id, output_type, publish_to_confluence)
-            return self._mock_result(output_type)
+            logger.info("[%s] MOCK agent extract — output_type=%s", job_id, output_type)
+            mock = self._mock_result(output_type)
+            mock["confluence_url"] = ""
+            mock["page_action"] = "pending"
+            # Seed publish context so publish() can be called safely in mock mode
+            self._pre_rendered_body = ""
+            self._publish_title = mock.get("title", "Meeting Notes")
+            self._action_items = mock.get("action_items") or []
+            return mock
 
         dest = confluence_destination or {}
-        space_key = dest.get("space_key") or ""
-        parent_page_id = dest.get("parent_page_id") or ""
         page_title_override = dest.get("page_title") or ""
 
         logger.info("[%s] Phase 1 — extraction (output_type=%s, custom_instructions=%s, context=%s)",
@@ -249,45 +258,33 @@ class MeetingAgent:
         logger.info("[%s] Page body rendered: %d chars", job_id, len(page_body))
 
         action_items = extracted.get("action_items") or []
-        # Use user-supplied page title override, fallback to extracted title
         publish_title = page_title_override or extracted.get("title", "Meeting Notes")
 
-        if publish_to_confluence:
-            logger.info("[%s] Phase 2 — Confluence tool loop (space=%r, parent=%r)",
-                        job_id, space_key, parent_page_id)
-            loop_result = self._run_tool_loop_raw(
-                title=publish_title,
-                page_body=page_body,
-                action_items=action_items,
-                job_id=job_id,
-                space_key=space_key,
-                parent_page_id=parent_page_id,
-            )
-        else:
-            logger.info("[%s] Confluence publish skipped (publish_to_confluence=False)", job_id)
-            incomplete = self._tool_flag_incomplete_action_items(action_items)
-            loop_result = _ToolLoopResult(
-                page_action="skipped",
-                incomplete_action_items=incomplete,
-            )
+        # Compute incomplete action items now — deterministic, no Gemini needed.
+        incomplete = self._tool_flag_incomplete_action_items(action_items)
+
+        # Persist publish context for the subsequent publish() call.
+        self._pre_rendered_body = page_body
+        self._publish_title = publish_title
+        self._action_items = action_items
 
         result: dict[str, Any] = {
             "output_type":             output_type,
             "title":                   publish_title,
-            "confluence_url":          loop_result.confluence_url,
-            "page_action":             loop_result.page_action,
-            "incomplete_action_items": loop_result.incomplete_action_items,
+            "confluence_url":          "",
+            "page_action":             "pending",
+            "incomplete_action_items": incomplete,
             "action_items":            action_items,
         }
 
         if output_type == "detailed":
             result.update({
-                "meeting_type":  meeting_type,
-                "attendees":     extracted.get("attendees") or [],
-                "summary":       extracted.get("summary", ""),
-                "decisions":     extracted.get("decisions") or [],
+                "meeting_type":   meeting_type,
+                "attendees":      extracted.get("attendees") or [],
+                "summary":        extracted.get("summary", ""),
+                "decisions":      extracted.get("decisions") or [],
                 "open_questions": extracted.get("open_questions") or [],
-                "highlights":    extracted.get("highlights") or [],
+                "highlights":     extracted.get("highlights") or [],
             })
         elif output_type == "mom":
             result.update({
@@ -302,9 +299,43 @@ class MeetingAgent:
             result.update({
                 "bullets": extracted.get("bullets") or [],
             })
-        # action_items: only title + action_items (already in base result)
 
         return result
+
+    def publish(
+        self,
+        job_id: str,
+        space_key: str = "",
+        parent_page_id: str = "",
+    ) -> dict[str, str]:
+        """
+        Phase 2 — Confluence publish.
+
+        Must be called after extract() (uses state stored on self).  Raises on
+        any Confluence error so the caller can handle it independently of
+        extraction failures.
+
+        Returns:
+            {"confluence_url": str, "page_action": "created"|"updated"|"skipped"}
+        """
+        if settings.mock_agent:
+            logger.info("[%s] MOCK agent publish — skipping Confluence", job_id)
+            return {"confluence_url": "", "page_action": "skipped (mock)"}
+
+        logger.info("[%s] Phase 2 — Confluence tool loop (space=%r, parent=%r)",
+                    job_id, space_key, parent_page_id)
+        loop_result = self._run_tool_loop_raw(
+            title=self._publish_title,
+            page_body=self._pre_rendered_body,
+            action_items=self._action_items,
+            job_id=job_id,
+            space_key=space_key,
+            parent_page_id=parent_page_id,
+        )
+        return {
+            "confluence_url": loop_result.confluence_url,
+            "page_action":    loop_result.page_action,
+        }
 
     @staticmethod
     def _mock_result(output_type: str) -> dict[str, Any]:
@@ -650,14 +681,17 @@ def run_agent(
     context_text: str = "",
 ) -> None:
     """
-    Orchestrate the full agent pipeline for one job:
-      1. Read jobs/{job_id}/transcript.json
-      2. Run MeetingAgent (extraction + Confluence publish)
-      3. Write jobs/{job_id}/result.json
-      4. Update DB status → DONE
+    Orchestrate the full agent pipeline for one job.
 
-    Any exception propagates to tasks.process_recording, which calls
-    _mark_failed_new_session and returns.
+    Step A — Extraction (raises on failure → task marks job FAILED):
+        Run Gemini Phase 1, save result_json to DB, mark job DONE.
+
+    Step B — Confluence publish (failure is non-fatal):
+        Attempt Phase 2.  On success: update confluence_url.
+        On failure: set publish_failed=True but leave status DONE.
+
+    Any exception from Step A propagates to tasks.process_recording,
+    which calls _mark_failed_new_session and returns.
     """
     from database import JobStatus, SessionLocal, update_job_status
 
@@ -677,41 +711,110 @@ def run_agent(
     logger.info("[%s] run_agent: %d chars, %d segments",
                 job_id, len(full_text), len(transcript_data.get("segments", [])))
 
-    # ----------------------------------------------------------------- run agent
+    dest = confluence_destination or {}
+    space_key      = dest.get("space_key") or ""
+    parent_page_id = dest.get("parent_page_id") or ""
+
+    # ----------------------------------------------------------------- Step A: extract
     agent = MeetingAgent()
-    result = agent.run(
+    result = agent.extract(
         transcript=full_text,
         job_id=job_id,
         output_type=output_type,
-        publish_to_confluence=publish_to_confluence,
         custom_instructions=custom_instructions,
-        confluence_destination=confluence_destination,
         context_text=context_text,
+        confluence_destination=confluence_destination,
     )
 
-    # ----------------------------------------------------------------- write result.json
+    # Save extraction result immediately so it's never lost.
+    result_json_str = json.dumps(result, ensure_ascii=False)
     result_path = job_dir / "result.json"
-    result_path.write_text(
-        json.dumps(result, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    logger.info("[%s] result.json written: %s", job_id, result_path)
+    result_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    # ----------------------------------------------------------------- update DB → DONE
     db = SessionLocal()
     try:
-        update_job_status(
-            db,
-            job_id,
-            JobStatus.DONE,
-            confluence_url=result.get("confluence_url", ""),
-            result_json=json.dumps(result, ensure_ascii=False),
-        )
+        update_job_status(db, job_id, JobStatus.DONE, result_json=result_json_str)
     finally:
         db.close()
 
-    logger.info("[%s] run_agent complete — page %s (%s), %d incomplete action items",
-                job_id,
-                result.get("confluence_url"),
-                result.get("page_action"),
-                len(result.get("incomplete_action_items", [])))
+    logger.info("[%s] Extraction complete — result saved", job_id)
+
+    # ----------------------------------------------------------------- Step B: publish
+    if not publish_to_confluence:
+        result["page_action"] = "skipped"
+        result_json_str = json.dumps(result, ensure_ascii=False)
+        result_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        db = SessionLocal()
+        try:
+            update_job_status(db, job_id, JobStatus.DONE, result_json=result_json_str)
+        finally:
+            db.close()
+        logger.info("[%s] run_agent complete — Confluence publish skipped", job_id)
+        return
+
+    db = SessionLocal()
+    try:
+        update_job_status(db, job_id, JobStatus.PUBLISHING)
+    finally:
+        db.close()
+
+    try:
+        pub = agent.publish(job_id=job_id, space_key=space_key, parent_page_id=parent_page_id)
+
+        result["confluence_url"] = pub["confluence_url"]
+        result["page_action"]    = pub["page_action"]
+        result_json_str = json.dumps(result, ensure_ascii=False)
+        result_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        db = SessionLocal()
+        try:
+            update_job_status(
+                db, job_id, JobStatus.DONE,
+                confluence_url=pub["confluence_url"],
+                result_json=result_json_str,
+                publish_failed=False,
+            )
+        finally:
+            db.close()
+
+        logger.info("[%s] run_agent complete — page %s (%s), %d incomplete action items",
+                    job_id, pub["confluence_url"], pub["page_action"],
+                    len(result.get("incomplete_action_items", [])))
+
+    except Exception:
+        logger.exception("[%s] Confluence publish failed — marking publish_failed", job_id)
+        db = SessionLocal()
+        try:
+            update_job_status(db, job_id, JobStatus.DONE, publish_failed=True)
+        finally:
+            db.close()
+
+
+def retry_publish(
+    job_id: str,
+    result: dict[str, Any],
+    space_key: str,
+    parent_page_id: str,
+) -> dict[str, str]:
+    """
+    Re-attempt Confluence publishing using a stored result dict.
+
+    Called by the retry_confluence_publish Celery task.  Reconstructs the
+    page body from the stored result dict, then runs MeetingAgent.publish().
+
+    Returns:
+        {"confluence_url": str, "page_action": str}
+    """
+    output_type  = result.get("output_type", "detailed")
+    meeting_type = result.get("meeting_type", "general") or "general"
+    title        = result.get("title", "Meeting Notes")
+    action_items = result.get("action_items") or []
+
+    page_body = render_confluence_body(output_type, result, meeting_type)
+
+    agent = MeetingAgent()
+    agent._pre_rendered_body = page_body
+    agent._publish_title     = title
+    agent._action_items      = action_items
+
+    return agent.publish(job_id=job_id, space_key=space_key, parent_page_id=parent_page_id)
