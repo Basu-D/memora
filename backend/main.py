@@ -326,13 +326,21 @@ async def job_status(job_id: str, db: Session = Depends(get_db)) -> JSONResponse
     except ValueError:
         raise HTTPException(status_code=404, detail="Job not found.")
 
+    agent_decisions: list = []
+    if job.result_json:
+        try:
+            agent_decisions = json.loads(job.result_json).get("agent_decisions") or []
+        except json.JSONDecodeError:
+            pass
+
     return JSONResponse(content={
-        "job_id": job.id,
-        "status": job.status.value,
-        "filename": job.filename,
-        "created_at": job.created_at.isoformat() if job.created_at else None,
-        "updated_at": job.updated_at.isoformat() if job.updated_at else None,
-        "error_message": job.error_message,
+        "job_id":          job.id,
+        "status":          job.status.value,
+        "filename":        job.filename,
+        "created_at":      job.created_at.isoformat() if job.created_at else None,
+        "updated_at":      job.updated_at.isoformat() if job.updated_at else None,
+        "error_message":   job.error_message,
+        "agent_decisions": agent_decisions,
     })
 
 

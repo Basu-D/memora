@@ -56,6 +56,19 @@ const STATUS_TO_ACTIVE = {
   failed:           -2,
 };
 
+// Human-readable prefix for each decision step.
+const DECISION_PREFIXES = {
+  meeting_type:    "Meeting type:",
+  duplicate_check: "Duplicate check:",
+  flagging:        "Action items:",
+  placement:       "Page placement:",
+};
+
+function formatDecision(d) {
+  const prefix = DECISION_PREFIXES[d.step];
+  return prefix ? `${prefix} ${d.decision}` : d.decision;
+}
+
 // ---------------------------------------------------------------------------
 // Icons
 // ---------------------------------------------------------------------------
@@ -171,6 +184,62 @@ function StepConnector({ done }) {
 }
 
 // ---------------------------------------------------------------------------
+// Agent Activity panel
+// ---------------------------------------------------------------------------
+
+/**
+ * Single decision row — fades and slides up on mount so new decisions feel
+ * like they're arriving in real time.  React only mounts a new element when
+ * the key changes, so existing decisions stay stable across polls.
+ */
+function DecisionEntry({ decision }) {
+  const [visible, setVisible] = useState(false);
+
+  useEffect(() => {
+    // One-frame delay gives the browser time to paint opacity:0 before we
+    // transition to opacity:1, making the animation actually visible.
+    const id = setTimeout(() => setVisible(true), 16);
+    return () => clearTimeout(id);
+  }, []);
+
+  return (
+    <div
+      className="flex items-start gap-2.5"
+      style={{
+        opacity:    visible ? 1 : 0,
+        transform:  visible ? "translateY(0)" : "translateY(6px)",
+        transition: "opacity 0.4s ease, transform 0.4s ease",
+      }}
+    >
+      <span className="text-base shrink-0 leading-none mt-0.5" role="img" aria-label="reasoning">🧠</span>
+      <div className="min-w-0">
+        <p className="text-sm font-semibold text-gray-800 leading-snug">
+          {formatDecision(decision)}
+        </p>
+        {decision.detail && (
+          <p className="text-xs text-gray-400 mt-0.5 leading-snug">{decision.detail}</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function AgentActivityPanel({ decisions }) {
+  return (
+    <div className="mt-6 border-t border-gray-100 pt-5">
+      <p className="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-3">
+        Agent Activity
+      </p>
+      <div className="flex flex-col gap-3">
+        {decisions.map((d) => (
+          <DecisionEntry key={d.step} decision={d} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Main component
 // ---------------------------------------------------------------------------
 
@@ -179,6 +248,7 @@ export default function ProcessingView({ jobId, onDone, onReset }) {
   const [filename,  setFilename]  = useState("");
   const [error,     setError]     = useState(null);
   const [pollError, setPollError] = useState(null);
+  const [decisions, setDecisions] = useState([]);
 
   const timerRef = useRef(null);
 
@@ -194,6 +264,9 @@ export default function ProcessingView({ jobId, onDone, onReset }) {
         setPollError(null);
         setStatus(data.status);
         if (data.filename) setFilename(data.filename);
+        if (Array.isArray(data.agent_decisions) && data.agent_decisions.length > 0) {
+          setDecisions(data.agent_decisions);
+        }
 
         if (data.status === "done") {
           onDone();
@@ -222,14 +295,6 @@ export default function ProcessingView({ jobId, onDone, onReset }) {
   // ── derived state ────────────────────────────────────────────────────────
   const activeIdx = STATUS_TO_ACTIVE[status] ?? 0;
   const isFailed  = status === "failed";
-
-  // For file uploads, skip the "downloading" step visually — it's never active.
-  const visibleSteps = status === "uploaded" || STATUS_TO_ACTIVE[status] === undefined
-    // We don't know yet — show all
-    ? STEPS
-    // Hide downloading step only if it was never the active step AND job is past it
-    : STEPS.filter((s, i) => !(s.key === "downloading" && activeIdx > 0 && status !== "downloading" && i === 0 && activeIdx === 1 && false));
-  // Simpler: always show all steps; file-upload jobs just skip "downloading" instantly.
 
   // ── render ──────────────────────────────────────────────────────────────
   return (
@@ -271,52 +336,59 @@ export default function ProcessingView({ jobId, onDone, onReset }) {
             </button>
           </div>
         ) : (
-          /* Stepper */
-          <div className="flex flex-col">
-            {STEPS.map((step, i) => {
-              const stepState =
-                i < activeIdx  ? "done"
-                : i === activeIdx ? "active"
-                : "pending";
-              const isLast = i === STEPS.length - 1;
+          <>
+            {/* Stepper */}
+            <div className="flex flex-col">
+              {STEPS.map((step, i) => {
+                const stepState =
+                  i < activeIdx  ? "done"
+                  : i === activeIdx ? "active"
+                  : "pending";
+                const isLast = i === STEPS.length - 1;
 
-              return (
-                <div key={step.key}>
-                  <div className="flex items-start gap-4">
-                    <StepCircle state={stepState} index={i} />
-                    <div className="flex-1 pt-1.5 pb-1">
-                      <div className="flex items-center justify-between">
-                        <span
-                          className={`text-sm font-semibold transition-colors duration-200 ${
-                            stepState === "done"    ? "text-teal-700"
-                            : stepState === "active" ? "text-gray-900"
-                            : "text-gray-400"
-                          }`}
-                        >
-                          {step.label}
-                        </span>
+                return (
+                  <div key={step.key}>
+                    <div className="flex items-start gap-4">
+                      <StepCircle state={stepState} index={i} />
+                      <div className="flex-1 pt-1.5 pb-1">
+                        <div className="flex items-center justify-between">
+                          <span
+                            className={`text-sm font-semibold transition-colors duration-200 ${
+                              stepState === "done"    ? "text-teal-700"
+                              : stepState === "active" ? "text-gray-900"
+                              : "text-gray-400"
+                            }`}
+                          >
+                            {step.label}
+                          </span>
+                          {stepState === "active" && (
+                            <span className="hidden sm:block text-xs text-teal-600 font-medium animate-pulse">
+                              {step.description}
+                            </span>
+                          )}
+                          {stepState === "done" && (
+                            <span className="text-xs text-teal-500">Done</span>
+                          )}
+                        </div>
                         {stepState === "active" && (
-                          <span className="hidden sm:block text-xs text-teal-600 font-medium animate-pulse">
+                          <span className="sm:hidden text-xs text-teal-600 font-medium animate-pulse mt-0.5 block">
                             {step.description}
                           </span>
                         )}
-                        {stepState === "done" && (
-                          <span className="text-xs text-teal-500">Done</span>
-                        )}
+                        <StepProgressBar state={stepState} estSeconds={step.estSeconds} />
                       </div>
-                      {stepState === "active" && (
-                        <span className="sm:hidden text-xs text-teal-600 font-medium animate-pulse mt-0.5 block">
-                          {step.description}
-                        </span>
-                      )}
-                      <StepProgressBar state={stepState} estSeconds={step.estSeconds} />
                     </div>
+                    {!isLast && <StepConnector done={i < activeIdx} />}
                   </div>
-                  {!isLast && <StepConnector done={i < activeIdx} />}
-                </div>
-              );
-            })}
-          </div>
+                );
+              })}
+            </div>
+
+            {/* Agent Activity — appears once decisions start arriving */}
+            {decisions.length > 0 && (
+              <AgentActivityPanel decisions={decisions} />
+            )}
+          </>
         )}
 
         {/* Poll error banner */}

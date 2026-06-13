@@ -94,6 +94,14 @@ function CheckIcon({ className }) {
   );
 }
 
+function ChevronIcon({ className }) {
+  return (
+    <svg className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="m19.5 8.25-7.5 7.5-7.5-7.5" />
+    </svg>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Section components
 // ---------------------------------------------------------------------------
@@ -211,6 +219,80 @@ function DecisionsSection({ decisions }) {
 }
 
 // ---------------------------------------------------------------------------
+// Agent decisions timeline
+// ---------------------------------------------------------------------------
+
+const AGENT_STEP_LABELS = {
+  meeting_type:    "Meeting type",
+  duplicate_check: "Duplicate check",
+  flagging:        "Action item review",
+  placement:       "Page placement",
+};
+
+function AgentDecisionsTimeline({ decisions }) {
+  const [open, setOpen] = useState(false);
+
+  if (!decisions?.length) return null;
+
+  return (
+    <div className="card overflow-hidden">
+      {/* Collapsible header */}
+      <button
+        onClick={() => setOpen((o) => !o)}
+        className="w-full px-6 py-4 flex items-center justify-between hover:bg-gray-50 transition-colors"
+        aria-expanded={open}
+      >
+        <div className="flex items-center gap-2">
+          <span className="text-base leading-none" role="img" aria-label="reasoning">🧠</span>
+          <span className="text-sm font-semibold text-gray-800">How the AI decided</span>
+          <span className="text-xs font-medium text-gray-400 bg-gray-100 rounded-full px-2 py-0.5">
+            {decisions.length} step{decisions.length !== 1 ? "s" : ""}
+          </span>
+        </div>
+        <ChevronIcon
+          className={`w-4 h-4 text-gray-400 transition-transform duration-200 ${open ? "rotate-180" : ""}`}
+        />
+      </button>
+
+      {/* Timeline body */}
+      {open && (
+        <div className="px-6 pb-5 border-t border-gray-100">
+          <div className="pt-4 flex flex-col">
+            {decisions.map((d, i) => {
+              const isLast = i === decisions.length - 1;
+              return (
+                <div key={d.step ?? i} className="flex gap-4 relative">
+                  {/* Vertical connector line */}
+                  {!isLast && (
+                    <div className="absolute left-[11px] top-6 bottom-0 w-px bg-gray-100" />
+                  )}
+                  {/* Timeline dot */}
+                  <div className="w-6 h-6 rounded-full bg-teal-50 border-2 border-teal-200 shrink-0 mt-0.5 z-10 flex items-center justify-center">
+                    <div className="w-1.5 h-1.5 rounded-full bg-teal-500" />
+                  </div>
+                  {/* Content */}
+                  <div className={`flex-1 min-w-0 ${isLast ? "" : "pb-4"}`}>
+                    <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">
+                      {AGENT_STEP_LABELS[d.step] ?? d.step}
+                    </p>
+                    <p className="text-sm font-semibold text-gray-800 mt-0.5 leading-snug">
+                      {d.decision}
+                    </p>
+                    {d.detail && (
+                      <p className="text-xs text-gray-500 mt-0.5 leading-snug">{d.detail}</p>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Main component
 // ---------------------------------------------------------------------------
 
@@ -274,12 +356,13 @@ export default function ResultView({ jobId, onReset }) {
   }
 
   // ── result data ──────────────────────────────────────────────────────────
-  const result     = data?.result ?? {};
-  const outputType = result.output_type ?? "detailed";
-  const typeMeta   = meetingTypeMeta(result.meeting_type);
-  const incomplete = result.incomplete_action_items ?? [];
-  const hasWarning = incomplete.length > 0;
-  const isMocked   = result.mocked === true;
+  const result         = data?.result ?? {};
+  const outputType     = result.output_type ?? "detailed";
+  const typeMeta       = meetingTypeMeta(result.meeting_type);
+  const incomplete     = result.incomplete_action_items ?? [];
+  const hasWarning     = incomplete.length > 0;
+  const isMocked       = result.mocked === true;
+  const agentDecisions = result.agent_decisions ?? [];
 
   return (
     <div className="min-h-screen bg-gray-50">
@@ -413,6 +496,9 @@ export default function ResultView({ jobId, onReset }) {
             </div>
           </div>
         )}
+
+        {/* ── How the AI decided ───────────────────────────────────────── */}
+        <AgentDecisionsTimeline decisions={agentDecisions} />
 
         {/* ════════════════════════════════════════════════════════════════
             DETAILED

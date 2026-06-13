@@ -26,8 +26,9 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import google.generativeai as genai
 
@@ -45,6 +46,13 @@ logger = logging.getLogger(__name__)
 
 MAX_TOOL_TURNS = 10      # hard cap on tool-call rounds per job
 MEETING_TYPES = frozenset({"sprint-review", "planning", "incident", "general"})
+
+_MEETING_TYPE_LABELS: dict[str, str] = {
+    "sprint-review": "Sprint Review",
+    "planning":      "Planning",
+    "incident":      "Incident",
+    "general":       "General Meeting",
+}
 
 # ---------------------------------------------------------------------------
 # Gemini tool declarations
@@ -173,6 +181,8 @@ class MeetingAgent:
         self._dest_space_key: str = ""
         self._dest_parent_page_id: str = ""
         self._pre_rendered_body: str = ""
+        self._decisions: list[dict] = []
+        self._on_decision: Callable[[list[dict]], None] | None = None
 
         # Phase 1: JSON extraction model (no tools, JSON response mode)
         self._extraction_model = genai.GenerativeModel(
@@ -193,6 +203,30 @@ class MeetingAgent:
                 temperature=0.2,
             ),
         )
+
+    # ------------------------------------------------------------------
+    # Decision log
+    # ------------------------------------------------------------------
+
+    @property
+    def decisions(self) -> list[dict]:
+        """Return a copy of all recorded decision entries."""
+        return list(self._decisions)
+
+    def _record_decision(self, step: str, decision: str, detail: str) -> None:
+        """Append a decision entry and fire the incremental-save callback."""
+        entry = {
+            "step":      step,
+            "decision":  decision,
+            "detail":    detail,
+            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        self._decisions.append(entry)
+        if self._on_decision:
+            try:
+                self._on_decision(list(self._decisions))
+            except Exception:
+                logger.warning("Decision callback failed for step=%r", step)
 
     # ------------------------------------------------------------------
     # Public entry points (two-phase: extract then publish)
@@ -235,6 +269,14 @@ class MeetingAgent:
             self._pre_rendered_body = ""
             self._publish_title = mock.get("title", "Meeting Notes")
             self._action_items = mock.get("action_items") or []
+            self._record_decision("meeting_type", "Sprint Review", "Detected from transcript content")
+            _incomplete = self._tool_flag_incomplete_action_items(self._action_items)
+            _n = len(_incomplete)
+            self._record_decision(
+                "flagging",
+                f"{_n} item{'s' if _n != 1 else ''} flagged" if _n else "All action items complete",
+                "Missing owner or deadline" if _n else "All items have owners and deadlines",
+            )
             return mock
 
         dest = confluence_destination or {}
@@ -254,6 +296,12 @@ class MeetingAgent:
             logger.warning("[%s] Unknown meeting_type %r → 'general'", job_id, meeting_type)
             meeting_type = "general"
 
+        self._record_decision(
+            "meeting_type",
+            _MEETING_TYPE_LABELS.get(meeting_type, meeting_type.replace("-", " ").title()),
+            "Detected from transcript content",
+        )
+
         page_body = render_confluence_body(output_type, extracted, meeting_type)
         logger.info("[%s] Page body rendered: %d chars", job_id, len(page_body))
 
@@ -262,6 +310,12 @@ class MeetingAgent:
 
         # Compute incomplete action items now — deterministic, no Gemini needed.
         incomplete = self._tool_flag_incomplete_action_items(action_items)
+        _n = len(incomplete)
+        self._record_decision(
+            "flagging",
+            f"{_n} item{'s' if _n != 1 else ''} flagged" if _n else "All action items complete",
+            "Missing owner or deadline" if _n else "All items have owners and deadlines",
+        )
 
         # Persist publish context for the subsequent publish() call.
         self._pre_rendered_body = page_body
@@ -320,6 +374,8 @@ class MeetingAgent:
         """
         if settings.mock_agent:
             logger.info("[%s] MOCK agent publish — skipping Confluence", job_id)
+            self._record_decision("duplicate_check", "No duplicate found", "Mock mode — Confluence skipped")
+            self._record_decision("placement", "Mock page", "Mock mode — Confluence publish skipped")
             return {"confluence_url": "", "page_action": "skipped (mock)"}
 
         logger.info("[%s] Phase 2 — Confluence tool loop (space=%r, parent=%r)",
@@ -546,18 +602,39 @@ class MeetingAgent:
     ) -> Any:
         """Route a Gemini function call to the correct implementation."""
         if name == "search_confluence":
-            return self._tool_search_confluence(args.get("query", ""))
+            result = self._tool_search_confluence(args.get("query", ""))
+            if result:
+                self._record_decision(
+                    "duplicate_check",
+                    "Found existing page",
+                    result[0].get("title", ""),
+                )
+            else:
+                self._record_decision(
+                    "duplicate_check",
+                    "No duplicate found",
+                    f"Searched for: {args.get('query', '')}",
+                )
+            return result
 
         if name == "create_confluence_page":
+            _space = args.get("space_key") or self._dest_space_key
+            _parent = args.get("parent_id") or self._dest_parent_page_id
             result = self._tool_create_confluence_page(
                 title=args.get("title", ""),
                 body="",  # always overridden by self._pre_rendered_body
-                space_key=args.get("space_key") or self._dest_space_key,
-                parent_id=args.get("parent_id") or self._dest_parent_page_id or None,
+                space_key=_space,
+                parent_id=_parent or None,
             )
             ctx.page_id = result.get("page_id", "")
             ctx.confluence_url = result.get("url", "")
             ctx.page_action = "created"
+            self._record_decision(
+                "placement",
+                args.get("title", "New page"),
+                (f"Refined from selected parent using space index" if _parent
+                 else f"Created at root of space {_space}"),
+            )
             return result
 
         if name == "update_confluence_page":
@@ -569,6 +646,11 @@ class MeetingAgent:
             ctx.page_id = result.get("page_id", "")
             ctx.confluence_url = result.get("url", "")
             ctx.page_action = "updated"
+            self._record_decision(
+                "placement",
+                args.get("title", "Existing page"),
+                f"Updated existing page {args.get('page_id', '')}",
+            )
             return result
 
         if name == "flag_incomplete_action_items":
@@ -717,6 +799,28 @@ def run_agent(
 
     # ----------------------------------------------------------------- Step A: extract
     agent = MeetingAgent()
+
+    # During PUBLISHING, fire a DB write after each tool call so the frontend
+    # can poll for decisions in real time.  During extract(), result_json isn't
+    # saved yet, so the callback short-circuits until it sees a non-null value.
+    def _persist_decisions(decisions: list[dict]) -> None:
+        from database import get_job as _gj
+        _db = SessionLocal()
+        try:
+            _job = _gj(_db, job_id)
+            if not _job.result_json:
+                return  # initial save not done yet — decisions will be bundled there
+            _current = json.loads(_job.result_json)
+            _current["agent_decisions"] = decisions
+            update_job_status(_db, job_id, _job.status,
+                              result_json=json.dumps(_current, ensure_ascii=False))
+        except Exception:
+            logger.warning("[%s] Could not persist incremental decisions", job_id)
+        finally:
+            _db.close()
+
+    agent._on_decision = _persist_decisions
+
     result = agent.extract(
         transcript=full_text,
         job_id=job_id,
@@ -725,6 +829,9 @@ def run_agent(
         context_text=context_text,
         confluence_destination=confluence_destination,
     )
+
+    # Include extract-phase decisions (meeting_type + flagging) in the initial save.
+    result["agent_decisions"] = agent.decisions
 
     # Save extraction result immediately so it's never lost, but keep the status
     # at PROCESSING — setting DONE here would cause the frontend poller to transition
@@ -745,6 +852,7 @@ def run_agent(
     # ----------------------------------------------------------------- Step B: publish
     if not publish_to_confluence:
         result["page_action"] = "skipped"
+        result["agent_decisions"] = agent.decisions
         result_json_str = json.dumps(result, ensure_ascii=False)
         result_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
         db = SessionLocal()
@@ -766,6 +874,7 @@ def run_agent(
 
         result["confluence_url"] = pub["confluence_url"]
         result["page_action"]    = pub["page_action"]
+        result["agent_decisions"] = agent.decisions  # all four decisions now present
         result_json_str = json.dumps(result, ensure_ascii=False)
         result_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -786,9 +895,13 @@ def run_agent(
 
     except Exception:
         logger.exception("[%s] Confluence publish failed — marking publish_failed", job_id)
+        # Preserve whatever decisions were recorded before the failure.
+        result["agent_decisions"] = agent.decisions
+        result_json_str = json.dumps(result, ensure_ascii=False)
         db = SessionLocal()
         try:
-            update_job_status(db, job_id, JobStatus.DONE, publish_failed=True)
+            update_job_status(db, job_id, JobStatus.DONE, publish_failed=True,
+                              result_json=result_json_str)
         finally:
             db.close()
 
