@@ -726,14 +726,17 @@ def run_agent(
         confluence_destination=confluence_destination,
     )
 
-    # Save extraction result immediately so it's never lost.
+    # Save extraction result immediately so it's never lost, but keep the status
+    # at PROCESSING — setting DONE here would cause the frontend poller to transition
+    # to ResultView before Confluence publishing runs, making the PUBLISHING step
+    # invisible in the stepper.
     result_json_str = json.dumps(result, ensure_ascii=False)
     result_path = job_dir / "result.json"
     result_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
 
     db = SessionLocal()
     try:
-        update_job_status(db, job_id, JobStatus.DONE, result_json=result_json_str)
+        update_job_status(db, job_id, JobStatus.PROCESSING, result_json=result_json_str)
     finally:
         db.close()
 

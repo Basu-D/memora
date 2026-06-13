@@ -119,12 +119,11 @@ export async function getConfluencePages(spaceKey) {
  * @param {string} customInstructions
  * @param {{space_key?:string, parent_page_id?:string, page_title?:string}} confluenceDest
  * @param {string} contextText
- * @param {string} contextReferenceUrl
  * @returns {Promise<{job_id: string, status: string}>}
  */
 export async function uploadMeeting(
   file, title = "", outputType = "detailed", publishToConfluence = true,
-  customInstructions = "", confluenceDest = {}, contextText = "", contextReferenceUrl = "",
+  customInstructions = "", confluenceDest = {}, contextText = "",
 ) {
   const formData = new FormData();
   formData.append("file", file);
@@ -136,7 +135,6 @@ export async function uploadMeeting(
   if (confluenceDest.parent_page_id)  formData.append("confluence_parent_page_id", confluenceDest.parent_page_id);
   if (confluenceDest.page_title)      formData.append("confluence_page_title", confluenceDest.page_title);
   if (contextText.trim())             formData.append("context_text", contextText.trim());
-  if (contextReferenceUrl.trim())     formData.append("confluence_reference_url", contextReferenceUrl.trim());
 
   const response = await apiFetch("/upload", {
     method: "POST",
@@ -161,12 +159,11 @@ export async function uploadMeeting(
  * @param {string} customInstructions
  * @param {{space_key?:string, parent_page_id?:string, page_title?:string}} confluenceDest
  * @param {string} contextText
- * @param {string} contextReferenceUrl
  * @returns {Promise<{job_id: string, status: string}>}
  */
 export async function submitUrlMeeting(
   url, title = "", outputType = "detailed", publishToConfluence = true,
-  customInstructions = "", confluenceDest = {}, contextText = "", contextReferenceUrl = "",
+  customInstructions = "", confluenceDest = {}, contextText = "",
 ) {
   const response = await apiFetch("/upload-url", {
     method: "POST",
@@ -181,7 +178,6 @@ export async function submitUrlMeeting(
       confluence_parent_page_id: confluenceDest.parent_page_id || "",
       confluence_page_title: confluenceDest.page_title || "",
       context_text: contextText.trim(),
-      confluence_reference_url: contextReferenceUrl.trim(),
     }),
   });
   return response.json();

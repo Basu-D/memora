@@ -322,10 +322,8 @@ export default function UploadView({ onJobCreated }) {
   const [pageTitle,           setPageTitle]           = useState("");
 
   // ── §4.3 Context input ──────────────────────────────────────────────────
-  const [showContext,          setShowContext]          = useState(false);
-  const [contextTab,           setContextTab]           = useState("text"); // "text" | "confluence"
-  const [contextText,          setContextText]          = useState("");
-  const [contextReferenceUrl,  setContextReferenceUrl]  = useState("");
+  const [showContext, setShowContext] = useState(false);
+  const [contextText, setContextText] = useState("");
 
   const CUSTOM_INSTRUCTIONS_MAX = 500;
   const inputRef = useRef(null);
@@ -432,7 +430,7 @@ export default function UploadView({ onJobCreated }) {
       try {
         const { job_id } = await uploadMeeting(
           file, "", outputType, publishToConfluence,
-          customInstructions, confluenceDest, contextText, contextReferenceUrl,
+          customInstructions, confluenceDest, contextText,
         );
         updatePrefsAfterSubmit({ outputType, publishToConfluence, selectedSpace, selectedParentPage });
         onJobCreated(job_id);
@@ -452,7 +450,7 @@ export default function UploadView({ onJobCreated }) {
       try {
         const { job_id } = await submitUrlMeeting(
           trimmed, "", outputType, publishToConfluence,
-          customInstructions, confluenceDest, contextText, contextReferenceUrl,
+          customInstructions, confluenceDest, contextText,
         );
         updatePrefsAfterSubmit({ outputType, publishToConfluence, selectedSpace, selectedParentPage });
         onJobCreated(job_id);
@@ -746,57 +744,16 @@ export default function UploadView({ onJobCreated }) {
           </button>
 
           {showContext && (
-            <div className="flex flex-col gap-2 rounded-xl border border-gray-200 p-3 bg-gray-50">
-              {/* Tab toggle */}
-              <div className="flex gap-1 text-xs">
-                {[
-                  { key: "text",       label: "Text context" },
-                  { key: "confluence", label: "Confluence reference" },
-                ].map(({ key, label }) => (
-                  <button
-                    key={key}
-                    type="button"
-                    onClick={() => setContextTab(key)}
-                    className={[
-                      "px-3 py-1 rounded-lg font-medium transition-colors",
-                      contextTab === key
-                        ? "bg-white text-gray-900 shadow-sm border border-gray-200"
-                        : "text-gray-500 hover:text-gray-700",
-                    ].join(" ")}
-                  >
-                    {label}
-                  </button>
-                ))}
-              </div>
-
-              {contextTab === "text" && (
-                <textarea
-                  value={contextText}
-                  onChange={(e) => setContextText(e.target.value)}
-                  placeholder="Describe what this meeting is about or provide background, e.g. 'Post-mortem for the payment gateway outage on May 12th'"
-                  rows={3}
-                  className="w-full rounded-xl border border-gray-200 bg-white px-4 py-2.5
-                             text-sm text-gray-900 placeholder:text-gray-400 resize-none
-                             focus:outline-none focus:ring-2 focus:ring-teal-500/40 focus:border-teal-500
-                             transition-colors"
-                />
-              )}
-
-              {contextTab === "confluence" && (
-                <div className="flex flex-col gap-1.5">
-                  <input
-                    type="url"
-                    value={contextReferenceUrl}
-                    onChange={(e) => setContextReferenceUrl(e.target.value)}
-                    placeholder="https://your-org.atlassian.net/wiki/spaces/…"
-                    className={inputCls}
-                  />
-                  <p className="text-xs text-gray-400">
-                    The content of this Confluence page will be fetched and provided as background context to the AI.
-                  </p>
-                </div>
-              )}
-            </div>
+            <textarea
+              value={contextText}
+              onChange={(e) => setContextText(e.target.value)}
+              placeholder="Describe what this meeting is about or provide background, e.g. 'Post-mortem for the payment gateway outage on May 12th'"
+              rows={3}
+              className="w-full rounded-xl border border-gray-200 bg-white px-4 py-2.5
+                         text-sm text-gray-900 placeholder:text-gray-400 resize-none
+                         focus:outline-none focus:ring-2 focus:ring-teal-500/40 focus:border-teal-500
+                         transition-colors"
+            />
           )}
         </div>
 

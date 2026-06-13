@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useCallback } from "react";
 import UploadView from "./views/UploadView.jsx";
 import ProcessingView from "./views/ProcessingView.jsx";
 import ResultView from "./views/ResultView.jsx";
@@ -23,14 +23,17 @@ export default function App() {
     setView("processing");
   }
 
-  function handleDone() {
+  // Stable references prevent ProcessingView's useEffect (which depends on
+  // onDone/onReset) from re-running and spawning duplicate poll loops on
+  // every parent re-render.
+  const handleDone = useCallback(() => {
     setView("result");
-  }
+  }, []);
 
-  function handleReset() {
+  const handleReset = useCallback(() => {
     setJobId(null);
     setView("upload");
-  }
+  }, []);
 
   if (view === "processing") {
     return (
