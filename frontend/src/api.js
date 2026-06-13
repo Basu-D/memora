@@ -255,6 +255,22 @@ export async function retryPublish(jobId) {
 }
 
 // ---------------------------------------------------------------------------
+// History
+// ---------------------------------------------------------------------------
+
+/**
+ * Fetch all processed jobs, newest first.
+ * Returns { jobs: [...], total: N }.
+ * Filtering is done client-side in HistoryView for instant feedback.
+ *
+ * @returns {Promise<{jobs: Array, total: number}>}
+ */
+export async function getHistory() {
+  const response = await apiFetch("/history");
+  return response.json();
+}
+
+// ---------------------------------------------------------------------------
 // Download
 // ---------------------------------------------------------------------------
 

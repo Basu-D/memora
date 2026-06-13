@@ -22,7 +22,7 @@ from sqlalchemy.orm import Session
 from auth import APIKeyMiddleware
 from config import settings
 from confluence import ConfluenceClient
-from database import JobStatus, create_job, get_db, get_job, init_db, update_job_status
+from database import JobStatus, create_job, get_db, get_job, init_db, list_jobs, update_job_status
 from tasks import process_recording
 
 logging.basicConfig(level=logging.INFO)
@@ -342,6 +342,63 @@ async def job_status(job_id: str, db: Session = Depends(get_db)) -> JSONResponse
         "error_message":   job.error_message,
         "agent_decisions": agent_decisions,
     })
+
+
+# ---------------------------------------------------------------------------
+# GET /history
+# ---------------------------------------------------------------------------
+
+@app.get("/history", tags=["jobs"])
+async def job_history(
+    search: str | None = None,
+    db: Session = Depends(get_db),
+) -> JSONResponse:
+    """
+    Return all jobs ordered by newest-first.
+
+    Each item includes meeting_type and a 100-character summary snippet
+    extracted from result_json.  The optional ?search= parameter filters
+    case-insensitively against the job title (extracted title or filename)
+    and the meeting type.
+    """
+    jobs = list_jobs(db)
+
+    search_term = search.strip().lower() if search and search.strip() else None
+
+    items = []
+    for job in jobs:
+        result: dict = {}
+        if job.result_json:
+            try:
+                result = json.loads(job.result_json)
+            except json.JSONDecodeError:
+                pass
+
+        meeting_type     = result.get("meeting_type") or ""
+        extracted_title  = result.get("title") or ""
+        summary          = result.get("summary") or ""
+
+        # Prefer the AI-extracted title; fall back to the uploaded filename.
+        display_title = extracted_title or job.filename
+
+        if search_term:
+            haystack = f"{display_title} {meeting_type}".lower()
+            if search_term not in haystack:
+                continue
+
+        items.append({
+            "job_id":          job.id,
+            "title":           display_title,
+            "filename":        job.filename,
+            "meeting_type":    meeting_type or None,
+            "status":          job.status.value,
+            "created_at":      job.created_at.isoformat() if job.created_at else None,
+            "confluence_url":  job.confluence_url,
+            "summary_snippet": summary[:100] or None,
+            "publish_failed":  bool(job.publish_failed),
+        })
+
+    return JSONResponse(content={"jobs": items, "total": len(items)})
 
 
 # ---------------------------------------------------------------------------

@@ -291,7 +291,16 @@ function ParentPageSelect({ pages, recentPages, selectedPage, onSelect, loading 
 // Main component
 // ---------------------------------------------------------------------------
 
-export default function UploadView({ onJobCreated }) {
+function ClockIcon({ className }) {
+  return (
+    <svg className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+      <path strokeLinecap="round" strokeLinejoin="round"
+        d="M12 6v6h4.5m4.5 0a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z" />
+    </svg>
+  );
+}
+
+export default function UploadView({ onJobCreated, onHistory }) {
   const [mode,      setMode]      = useState("url"); // "file" | "url"
 
   // ── file mode ───────────────────────────────────────────────────────────
@@ -469,7 +478,20 @@ export default function UploadView({ onJobCreated }) {
 
   // ── Render ──────────────────────────────────────────────────────────────
   return (
-    <div className="min-h-screen flex flex-col items-center justify-center p-6 bg-gray-50">
+    <div className="relative min-h-screen flex flex-col items-center justify-center p-6 bg-gray-50">
+      {/* History link */}
+      {onHistory && (
+        <button
+          type="button"
+          onClick={onHistory}
+          className="absolute top-4 right-4 flex items-center gap-1.5 text-sm text-gray-500
+                     hover:text-teal-600 font-medium transition-colors"
+        >
+          <ClockIcon className="w-4 h-4" />
+          History
+        </button>
+      )}
+
       {/* Logo */}
       <div className="mb-8 text-center">
         <div className="inline-flex items-center gap-2 mb-2">

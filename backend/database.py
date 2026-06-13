@@ -177,6 +177,11 @@ def update_job_status(
     return job
 
 
+def list_jobs(db: Session) -> list[Job]:
+    """Return all jobs ordered by created_at descending."""
+    return db.query(Job).order_by(Job.created_at.desc()).all()
+
+
 def get_job(db: Session, job_id: str) -> Job:
     """
     Fetch a job by its UUID.
