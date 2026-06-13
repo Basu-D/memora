@@ -1,14 +1,25 @@
 """
-SQLAlchemy database setup and Job model.
+SQLAlchemy database setup, models, and CRUD helpers.
 Connection string is the only thing that needs to change to move from SQLite to PostgreSQL.
+
+Schema migrations are managed by Alembic (see alembic/).
+init_db() still calls Base.metadata.create_all for fresh databases, and keeps a
+safe-ALTER list as a fallback for deployments that don't run Alembic.
 """
+
+from __future__ import annotations
 
 import enum
 import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import create_engine, Column, String, Text, DateTime, Boolean, Enum as SAEnum, text
+from sqlalchemy import (
+    create_engine,
+    Column, String, Text, DateTime, Boolean,
+    Enum as SAEnum, ForeignKey, Index,
+    text,
+)
 from sqlalchemy.orm import DeclarativeBase, sessionmaker, Session
 
 from config import settings
@@ -48,6 +59,28 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+# ---------------------------------------------------------------------------
+# Models
+# ---------------------------------------------------------------------------
+
+class User(Base):
+    __tablename__ = "users"
+
+    id                        = Column(String(36),  primary_key=True, default=lambda: str(uuid.uuid4()))
+    email                     = Column(String(256), nullable=False, unique=True)
+    display_name              = Column(String(256), nullable=True)
+    webex_host_id             = Column(String(256), nullable=True)
+    confluence_space_key      = Column(String(64),  nullable=True)
+    confluence_parent_page_id = Column(String(64),  nullable=True)
+    created_at                = Column(DateTime(timezone=True), nullable=False, default=_now)
+    updated_at                = Column(DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
+
+    __table_args__ = (
+        Index("ix_users_email",         "email",         unique=True),
+        Index("ix_users_webex_host_id", "webex_host_id", unique=False),
+    )
+
+
 class Job(Base):
     __tablename__ = "jobs"
 
@@ -74,6 +107,13 @@ class Job(Base):
     confluence_url = Column(String(2048), nullable=True)
     result_json = Column(Text, nullable=True)
     publish_failed = Column(Boolean, nullable=False, default=False)
+    # User association
+    user_id    = Column(String(36), ForeignKey("users.id"), nullable=True)
+    host_email = Column(String(256), nullable=True)   # raw email from webhook for traceability
+
+    __table_args__ = (
+        Index("ix_jobs_user_id", "user_id", unique=False),
+    )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -86,11 +126,13 @@ class Job(Base):
             "confluence_url": self.confluence_url,
             "result_json": self.result_json,
             "storage_path": self.storage_path,
+            "user_id": self.user_id,
+            "host_email": self.host_email,
         }
 
 
 # ---------------------------------------------------------------------------
-# CRUD
+# CRUD — jobs
 # ---------------------------------------------------------------------------
 
 def create_job(
@@ -107,10 +149,10 @@ def create_job(
     context_text: str | None = None,
     confluence_reference_url: str | None = None,
     screenshots_enabled: bool = False,
-) -> Job:
-    """
-    Insert a new Job row with status UPLOADED and return it.
-    """
+    user_id: str | None = None,
+    host_email: str | None = None,
+) -> "Job":
+    """Insert a new Job row with status UPLOADED and return it."""
     job = Job(
         filename=filename,
         storage_path=storage_path,
@@ -124,6 +166,8 @@ def create_job(
         context_text=context_text,
         confluence_reference_url=confluence_reference_url,
         screenshots_enabled=screenshots_enabled,
+        user_id=user_id,
+        host_email=host_email,
     )
     db.add(job)
     db.commit()
@@ -140,20 +184,9 @@ def update_job_status(
     confluence_url: str | None = None,
     result_json: str | None = None,
     publish_failed: bool | None = None,
-) -> Job:
+) -> "Job":
     """
     Transition a job to a new status and optionally set result fields.
-
-    Args:
-        db: Active SQLAlchemy session.
-        job_id: UUID string of the job to update.
-        status: The new JobStatus value.
-        error_message: Set when transitioning to FAILED.
-        confluence_url: Set when transitioning to DONE.
-        result_json: JSON string of extracted meeting data; set when transitioning to DONE.
-
-    Returns:
-        The updated Job instance.
 
     Raises:
         ValueError: If no job with the given ID exists.
@@ -177,21 +210,24 @@ def update_job_status(
     return job
 
 
-def list_jobs(db: Session) -> list[Job]:
+def assign_job_to_user(db: Session, job_id: str, user_id: str) -> "Job":
+    """Link an existing job to a user. No-ops gracefully if already linked."""
+    job = get_job(db, job_id)
+    job.user_id = user_id
+    job.updated_at = _now()
+    db.commit()
+    db.refresh(job)
+    return job
+
+
+def list_jobs(db: Session) -> list["Job"]:
     """Return all jobs ordered by created_at descending."""
     return db.query(Job).order_by(Job.created_at.desc()).all()
 
 
-def get_job(db: Session, job_id: str) -> Job:
+def get_job(db: Session, job_id: str) -> "Job":
     """
     Fetch a job by its UUID.
-
-    Args:
-        db: Active SQLAlchemy session.
-        job_id: UUID string to look up.
-
-    Returns:
-        The matching Job instance.
 
     Raises:
         ValueError: If no job with the given ID exists.
@@ -200,6 +236,52 @@ def get_job(db: Session, job_id: str) -> Job:
     if job is None:
         raise ValueError(f"Job not found: {job_id}")
     return job
+
+
+# ---------------------------------------------------------------------------
+# CRUD — users
+# ---------------------------------------------------------------------------
+
+def get_or_create_user_by_email(db: Session, email: str) -> User:
+    """
+    Look up a User by email; insert one if it doesn't exist yet.
+    Safe to call on every inbound webhook — only creates on first occurrence.
+    """
+    user = db.query(User).filter(User.email == email).first()
+    if user is None:
+        user = User(email=email)
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+    return user
+
+
+def get_user_by_webex_host_id(db: Session, host_id: str) -> User | None:
+    """Return the User whose webex_host_id matches, or None."""
+    return db.query(User).filter(User.webex_host_id == host_id).first()
+
+
+def update_user_preferences(
+    db: Session,
+    user_id: str,
+    space_key: str | None,
+    parent_page_id: str | None,
+) -> User:
+    """
+    Persist a user's preferred Confluence destination.
+
+    Raises:
+        ValueError: If no user with the given ID exists.
+    """
+    user = db.query(User).filter(User.id == user_id).first()
+    if user is None:
+        raise ValueError(f"User not found: {user_id}")
+    user.confluence_space_key = space_key
+    user.confluence_parent_page_id = parent_page_id
+    user.updated_at = _now()
+    db.commit()
+    db.refresh(user)
+    return user
 
 
 # ---------------------------------------------------------------------------
@@ -216,10 +298,15 @@ def get_db():
 
 
 def init_db() -> None:
-    """Create all tables. Called once at application startup."""
+    """
+    Create all tables for a fresh database, then apply safe ALTER TABLE
+    fallbacks for existing deployments that are not managed by Alembic.
+
+    For proper schema versioning, run: alembic upgrade head
+    """
     Base.metadata.create_all(bind=engine)
-    # Safe migrations for columns added after initial deploy.
     _migrations = [
+        # Original columns added after initial deploy
         "ALTER TABLE jobs ADD COLUMN source_url VARCHAR(2048)",
         "ALTER TABLE jobs ADD COLUMN output_type VARCHAR(32) NOT NULL DEFAULT 'detailed'",
         "ALTER TABLE jobs ADD COLUMN publish_to_confluence BOOLEAN NOT NULL DEFAULT 1",
@@ -235,6 +322,9 @@ def init_db() -> None:
         "ALTER TABLE jobs ADD COLUMN screenshots_enabled BOOLEAN NOT NULL DEFAULT 0",
         # publish_failed — set when Confluence publish fails but extraction succeeded
         "ALTER TABLE jobs ADD COLUMN publish_failed BOOLEAN NOT NULL DEFAULT 0",
+        # User association (Alembic migration: 0001_add_users_job_user_fields)
+        "ALTER TABLE jobs ADD COLUMN user_id VARCHAR(36)",
+        "ALTER TABLE jobs ADD COLUMN host_email VARCHAR(256)",
     ]
     with engine.connect() as conn:
         for sql in _migrations:

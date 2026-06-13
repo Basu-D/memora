@@ -17,7 +17,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from config import settings
 
 # Routes that bypass API key checks (health probes, static assets, etc.)
-EXEMPT_PATHS = {"/health", "/docs", "/openapi.json", "/redoc", "/session"}
+EXEMPT_PATHS = {"/health", "/docs", "/openapi.json", "/redoc", "/session", "/webhooks/webex"}
 
 _SESSION_MAX_AGE = 86_400  # 24 hours
 

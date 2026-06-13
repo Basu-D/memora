@@ -4,6 +4,8 @@ FastAPI application — upload endpoint, job status, and result retrieval.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import io
 import json
 import logging
@@ -22,7 +24,10 @@ from sqlalchemy.orm import Session
 from auth import APIKeyMiddleware
 from config import settings
 from confluence import ConfluenceClient
-from database import JobStatus, create_job, get_db, get_job, init_db, list_jobs, update_job_status
+from database import (
+    JobStatus, create_job, get_db, get_job, init_db, list_jobs, update_job_status,
+    get_or_create_user_by_email, get_user_by_webex_host_id,
+)
 from tasks import process_recording
 
 logging.basicConfig(level=logging.INFO)
@@ -542,6 +547,107 @@ async def download_job_docx(
         io.BytesIO(docx_bytes),
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /webhooks/webex
+# ---------------------------------------------------------------------------
+
+def _verify_webex_signature(raw_body: bytes, header: str, secret: str) -> bool:
+    """Return True when X-Spark-Signature matches HMAC-SHA1 of raw_body."""
+    expected = hmac.new(secret.encode(), raw_body, hashlib.sha1).hexdigest()
+    return hmac.compare_digest(expected, header)
+
+
+@app.post("/webhooks/webex", tags=["webhooks"])
+async def webex_webhook(request: Request, db: Session = Depends(get_db)) -> JSONResponse:
+    """
+    Receive Webex recording.ready webhook events (resource=recordings, event=created).
+
+    Flow:
+      1. Validate X-Spark-Signature (HMAC-SHA1) if WEBEX_WEBHOOK_SECRET is set.
+      2. Ignore events we don't handle (resource/event mismatch) with a 200.
+      3. Resolve or create the host User via webex_host_id → email fallback.
+      4. Create a Job record with user_id and host_email.
+      5. Queue process_webex_recording (downloads + pipeline runs in Celery).
+      6. Return 200 immediately — Webex retries on non-2xx responses.
+    """
+    raw_body = await request.body()
+
+    # ── Signature validation ─────────────────────────────────────────────────
+    if settings.webex_webhook_secret:
+        signature = request.headers.get("X-Spark-Signature", "")
+        if not _verify_webex_signature(raw_body, signature, settings.webex_webhook_secret):
+            logger.warning("Webex webhook: invalid X-Spark-Signature — rejected")
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
+                                detail="Invalid webhook signature.")
+
+    # ── Parse payload ────────────────────────────────────────────────────────
+    try:
+        payload = json.loads(raw_body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="Invalid JSON payload.")
+
+    # ── Filter to recording.ready events only ────────────────────────────────
+    if payload.get("resource") != "recordings" or payload.get("event") != "created":
+        # Return 200 so Webex doesn't retry — we just don't process it.
+        return JSONResponse(content={"detail": "event ignored"})
+
+    # ── Extract fields ───────────────────────────────────────────────────────
+    data             = payload.get("data") or {}
+    host_email       = (data.get("hostEmail") or "").strip()
+    host_display_name = (data.get("hostDisplayName") or "").strip() or None
+    recording_id     = (data.get("recordingId") or "").strip()
+    actor_id         = (payload.get("actorId") or "").strip()   # Webex host's person ID
+
+    if not recording_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="Missing recordingId in webhook payload.")
+    if not host_email:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="Missing hostEmail in webhook payload.")
+
+    # ── Resolve user ─────────────────────────────────────────────────────────
+    # Try the stable Webex host ID first; fall back to email lookup / creation.
+    user = get_user_by_webex_host_id(db, actor_id) if actor_id else None
+
+    if user is None:
+        user = get_or_create_user_by_email(db, host_email)
+
+    # Back-fill any missing fields on the user record.
+    needs_commit = False
+    if actor_id and not user.webex_host_id:
+        user.webex_host_id = actor_id
+        needs_commit = True
+    if host_display_name and not user.display_name:
+        user.display_name = host_display_name
+        needs_commit = True
+    if needs_commit:
+        db.commit()
+        db.refresh(user)
+
+    # ── Create job ───────────────────────────────────────────────────────────
+    job = create_job(
+        db,
+        filename=f"{recording_id}.mp4",
+        user_id=user.id,
+        host_email=host_email,
+    )
+
+    # ── Queue Celery task ────────────────────────────────────────────────────
+    from tasks import process_webex_recording
+    process_webex_recording.delay(job.id, recording_id)
+
+    logger.info(
+        "Webex webhook: recording_id=%s → job=%s (user=%s actor=%s)",
+        recording_id, job.id, user.email, actor_id or "unknown",
+    )
+
+    return JSONResponse(
+        status_code=status.HTTP_200_OK,
+        content={"job_id": job.id, "status": job.status.value},
     )
 
 
