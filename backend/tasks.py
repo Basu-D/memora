@@ -44,7 +44,9 @@ celery_app.conf.update(
 
 VIDEO_EXTENSIONS = {".mp4", ".webm"}
 
-OPENAI_AUDIO_SIZE_LIMIT = 24 * 1024 * 1024  # 24 MB (API limit is 25 MB)
+CHUNK_SIZE_LIMIT = 20 * 1024 * 1024   # trigger chunking above 20 MB (API limit is 25 MB)
+CHUNK_DURATION   = 600                  # seconds per chunk (10 minutes)
+CHUNK_OVERLAP    = 10                   # seconds of overlap to preserve boundary context
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +251,124 @@ def _extract_audio(source: Path, job_dir: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
+# Chunking helpers — used by _transcribe when the file exceeds CHUNK_SIZE_LIMIT
+# ---------------------------------------------------------------------------
+
+def _get_audio_duration(audio_path: Path) -> float:
+    """Return duration in seconds via ffprobe."""
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(audio_path),
+        ],
+        capture_output=True, text=True, timeout=30,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"ffprobe failed: {result.stderr.strip()}")
+    return float(result.stdout.strip())
+
+
+def _split_into_chunks(audio_path: Path, job_dir: Path, job_id: str) -> list[tuple[Path, float]]:
+    """
+    Split *audio_path* into overlapping 10-minute MP3 chunks.
+
+    Each chunk is CHUNK_DURATION seconds long with a CHUNK_OVERLAP-second tail
+    (so the next chunk's Whisper call has a few seconds of context from the
+    boundary).  The overlap region is stripped during stitching.
+
+    Returns:
+        List of (chunk_path, chunk_start_seconds) tuples in order.
+    """
+    chunks_dir = job_dir / "chunks"
+    chunks_dir.mkdir(exist_ok=True)
+
+    duration = _get_audio_duration(audio_path)
+    logger.info("[%s] Audio duration: %.1f s — splitting into %.0f-s chunks", job_id, duration, CHUNK_DURATION)
+
+    chunks: list[tuple[Path, float]] = []
+    chunk_index = 0
+    start = 0.0
+
+    while start < duration:
+        chunk_path = chunks_dir / f"chunk_{chunk_index:03d}.mp3"
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", str(start),          # input-side seek (fast, sub-second accuracy)
+            "-i", str(audio_path),
+            "-t", str(CHUNK_DURATION + CHUNK_OVERLAP),
+            "-acodec", "copy",
+            str(chunk_path),
+        ]
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"ffmpeg chunk {chunk_index} failed (rc={result.returncode}): "
+                f"{result.stderr[-400:].strip()}"
+            )
+
+        size_mb = chunk_path.stat().st_size / 1024 / 1024
+        logger.info("[%s] Chunk %d: start=%.1fs size=%.1fMB", job_id, chunk_index, start, size_mb)
+
+        chunks.append((chunk_path, start))
+        start += CHUNK_DURATION
+        chunk_index += 1
+
+    return chunks
+
+
+def _transcribe_chunked(audio_path: Path, job_dir: Path, job_id: str, client) -> dict:
+    """
+    Transcribe a large audio file by splitting it into chunks and stitching
+    the results.
+
+    For each chunk after the first, the leading CHUNK_OVERLAP seconds of
+    segments are discarded (they overlap with the tail of the previous chunk).
+    Segment timestamps are adjusted to absolute positions in the original file.
+    """
+    chunks = _split_into_chunks(audio_path, job_dir, job_id)
+
+    all_segments: list[dict] = []
+    language = "unknown"
+
+    for i, (chunk_path, chunk_start) in enumerate(chunks):
+        logger.info("[%s] Whisper chunk %d/%d (offset=%.1fs)", job_id, i + 1, len(chunks), chunk_start)
+
+        with chunk_path.open("rb") as f:
+            response = client.audio.transcriptions.create(
+                model="whisper-1",
+                file=f,
+                response_format="verbose_json",
+                timestamp_granularities=["segment"],
+            )
+
+        if response.language and language == "unknown":
+            language = response.language
+
+        # Drop the overlap region from every chunk except the first so we don't
+        # double-count the audio that appears at the end of the previous chunk.
+        overlap_cutoff = CHUNK_OVERLAP if i > 0 else 0.0
+
+        for seg in (response.segments or []):
+            if seg.start < overlap_cutoff:
+                continue
+            all_segments.append({
+                "start": round(chunk_start + seg.start, 3),
+                "end":   round(chunk_start + seg.end,   3),
+                "text":  seg.text.strip(),
+            })
+
+    full_text = " ".join(s["text"] for s in all_segments)
+    logger.info("[%s] Chunked transcript: %d chars across %d segments from %d chunk(s)",
+                job_id, len(full_text), len(all_segments), len(chunks))
+
+    return {"full_text": full_text, "segments": all_segments, "language": language}
+
+
+# ---------------------------------------------------------------------------
 # Step 2 helper — OpenAI Whisper API transcription
 # ---------------------------------------------------------------------------
 
@@ -266,8 +386,10 @@ def _transcribe(audio_path: Path, job_dir: Path, job_id: str) -> Path:
             "language":   "en"
         }
 
+    Files over CHUNK_SIZE_LIMIT are automatically split into 10-minute chunks,
+    transcribed separately, and stitched before writing.
+
     Raises:
-        RuntimeError: If the audio exceeds the 25 MB API limit.
         openai.APIError: On API-level failures (propagates to the task).
     """
     if settings.mock_transcription:
@@ -302,40 +424,37 @@ def _transcribe(audio_path: Path, job_dir: Path, job_id: str) -> Path:
 
     from openai import OpenAI
 
-    file_size = audio_path.stat().st_size
-    if file_size > OPENAI_AUDIO_SIZE_LIMIT:
-        size_mb = file_size / 1024 / 1024
-        raise RuntimeError(
-            f"Audio file is {size_mb:.0f} MB — OpenAI Whisper API limit is 25 MB. "
-            "This recording is too long (approx. >50 minutes). "
-            "Please split it into shorter segments and resubmit."
-        )
-
     client = OpenAI(api_key=settings.openai_api_key)
+    file_size = audio_path.stat().st_size
+    size_mb = file_size / 1024 / 1024
 
-    logger.info("[%s] OpenAI Whisper API transcribing %s (%.1f MB)",
-                job_id, audio_path.name, file_size / 1024 / 1024)
+    if file_size > CHUNK_SIZE_LIMIT:
+        logger.info("[%s] Audio is %.1f MB — using chunked transcription", job_id, size_mb)
+        transcript = _transcribe_chunked(audio_path, job_dir, job_id, client)
+    else:
+        logger.info("[%s] OpenAI Whisper API transcribing %s (%.1f MB)",
+                    job_id, audio_path.name, size_mb)
 
-    with audio_path.open("rb") as f:
-        response = client.audio.transcriptions.create(
-            model="whisper-1",
-            file=f,
-            response_format="verbose_json",
-            timestamp_granularities=["segment"],
-        )
+        with audio_path.open("rb") as f:
+            response = client.audio.transcriptions.create(
+                model="whisper-1",
+                file=f,
+                response_format="verbose_json",
+                timestamp_granularities=["segment"],
+            )
 
-    transcript = {
-        "full_text": response.text.strip(),
-        "segments": [
-            {
-                "start": round(seg.start, 3),
-                "end":   round(seg.end, 3),
-                "text":  seg.text.strip(),
-            }
-            for seg in (response.segments or [])
-        ],
-        "language": response.language or "unknown",
-    }
+        transcript = {
+            "full_text": response.text.strip(),
+            "segments": [
+                {
+                    "start": round(seg.start, 3),
+                    "end":   round(seg.end, 3),
+                    "text":  seg.text.strip(),
+                }
+                for seg in (response.segments or [])
+            ],
+            "language": response.language or "unknown",
+        }
 
     transcript_path = job_dir / "transcript.json"
     transcript_path.write_text(
