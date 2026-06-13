@@ -27,6 +27,15 @@ services:
       retries: 5
     # Port not exposed to the host — only backend/worker need it internally
 
+  # ── MailHog (local SMTP + web UI for email testing) ───────────────────────
+  mailhog:
+    image: mailhog/mailhog:latest
+    container_name: memora_mailhog
+    ports:
+      - "1025:1025"   # SMTP
+      - "8025:8025"   # Web UI
+    restart: unless-stopped
+
   # ── FastAPI backend ────────────────────────────────────────────────────────
   backend:
     build:
@@ -48,6 +57,8 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+      mailhog:
+        condition: service_started
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
       interval: 15s
