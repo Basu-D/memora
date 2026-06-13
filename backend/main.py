@@ -26,7 +26,8 @@ from config import settings
 from confluence import ConfluenceClient
 from database import (
     JobStatus, create_job, get_db, get_job, init_db, list_jobs, update_job_status,
-    get_or_create_user_by_email, get_user_by_webex_host_id,
+    get_or_create_user_by_email, get_user_by_email, get_user_by_webex_host_id,
+    update_user_preferences, list_jobs_by_user,
 )
 from tasks import process_recording
 
@@ -548,6 +549,97 @@ async def download_job_docx(
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+# ---------------------------------------------------------------------------
+# User preferences + per-user job list
+# ---------------------------------------------------------------------------
+
+class UserPreferencesUpdate(BaseModel):
+    confluence_space_key: str = ""
+    confluence_parent_page_id: str = ""
+
+
+@app.get("/users/{email}/preferences", tags=["users"])
+async def get_user_preferences(email: str, db: Session = Depends(get_db)) -> JSONResponse:
+    """
+    Return the Confluence preferences saved for a user.
+
+    Response: { email, display_name, confluence_space_key, confluence_parent_page_id }
+    Returns 404 if the user has never been seen by Memora.
+    """
+    user = get_user_by_email(db, email)
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found.")
+    return JSONResponse(content={
+        "email":                     user.email,
+        "display_name":              user.display_name,
+        "confluence_space_key":      user.confluence_space_key,
+        "confluence_parent_page_id": user.confluence_parent_page_id,
+    })
+
+
+@app.put("/users/{email}/preferences", tags=["users"])
+async def put_user_preferences(
+    email: str,
+    body: UserPreferencesUpdate,
+    db: Session = Depends(get_db),
+) -> JSONResponse:
+    """
+    Save or update a user's preferred Confluence destination.
+
+    Creates the user record if it doesn't exist yet (idempotent first-time setup).
+    Returns the full updated user object.
+    """
+    user = get_or_create_user_by_email(db, email)
+    user = update_user_preferences(
+        db,
+        user.id,
+        space_key=body.confluence_space_key.strip() or None,
+        parent_page_id=body.confluence_parent_page_id.strip() or None,
+    )
+    return JSONResponse(content={
+        "email":                     user.email,
+        "display_name":              user.display_name,
+        "confluence_space_key":      user.confluence_space_key,
+        "confluence_parent_page_id": user.confluence_parent_page_id,
+        "updated_at":                user.updated_at.isoformat() if user.updated_at else None,
+    })
+
+
+@app.get("/users/{email}/jobs", tags=["users"])
+async def get_user_jobs(email: str, db: Session = Depends(get_db)) -> JSONResponse:
+    """
+    Return all jobs belonging to a user, ordered by newest-first.
+
+    Powers the per-user dashboard/filtered view.
+    Returns 404 if the user does not exist.
+    """
+    user = get_user_by_email(db, email)
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    jobs = list_jobs_by_user(db, user.id)
+
+    items = []
+    for job in jobs:
+        result: dict = {}
+        if job.result_json:
+            try:
+                result = json.loads(job.result_json)
+            except json.JSONDecodeError:
+                pass
+        meeting_title = result.get("title") or job.filename
+        items.append({
+            "id":            job.id,
+            "status":        job.status.value,
+            "meeting_title": meeting_title,
+            "confluence_url": job.confluence_url,
+            "created_at":    job.created_at.isoformat() if job.created_at else None,
+            "host_email":    job.host_email,
+        })
+
+    return JSONResponse(content={"jobs": items, "total": len(items)})
 
 
 # ---------------------------------------------------------------------------

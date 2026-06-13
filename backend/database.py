@@ -256,9 +256,19 @@ def get_or_create_user_by_email(db: Session, email: str) -> User:
     return user
 
 
+def get_user_by_email(db: Session, email: str) -> User | None:
+    """Return the User with the given email, or None."""
+    return db.query(User).filter(User.email == email).first()
+
+
 def get_user_by_webex_host_id(db: Session, host_id: str) -> User | None:
     """Return the User whose webex_host_id matches, or None."""
     return db.query(User).filter(User.webex_host_id == host_id).first()
+
+
+def list_jobs_by_user(db: Session, user_id: str) -> list[Job]:
+    """Return all jobs for a given user ordered by created_at descending."""
+    return db.query(Job).filter(Job.user_id == user_id).order_by(Job.created_at.desc()).all()
 
 
 def update_user_preferences(

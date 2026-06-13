@@ -284,3 +284,46 @@ export function getDownloadUrl(jobId) {
   const token = _sessionToken;
   return `${API_ROOT}/jobs/${jobId}/download${token ? `?session_token=${encodeURIComponent(token)}` : ""}`;
 }
+
+// ---------------------------------------------------------------------------
+// User preferences
+// ---------------------------------------------------------------------------
+
+/**
+ * Fetch saved Confluence preferences for a user.
+ * Returns 404 if the user hasn't been seen by Memora yet — handle gracefully.
+ *
+ * @param {string} email
+ * @returns {Promise<{email, display_name, confluence_space_key, confluence_parent_page_id}>}
+ */
+export async function getUserPreferences(email) {
+  const response = await apiFetch(`/users/${encodeURIComponent(email)}/preferences`);
+  return response.json();
+}
+
+/**
+ * Save or update a user's Confluence preferences.
+ * Creates the user record on first call (upsert).
+ *
+ * @param {string} email
+ * @param {{ confluence_space_key: string, confluence_parent_page_id: string }} prefs
+ */
+export async function updateUserPreferences(email, prefs) {
+  const response = await apiFetch(`/users/${encodeURIComponent(email)}/preferences`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(prefs),
+  });
+  return response.json();
+}
+
+/**
+ * Fetch all jobs belonging to a user, newest first.
+ *
+ * @param {string} email
+ * @returns {Promise<{jobs: Array, total: number}>}
+ */
+export async function getUserJobs(email) {
+  const response = await apiFetch(`/users/${encodeURIComponent(email)}/jobs`);
+  return response.json();
+}
