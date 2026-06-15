@@ -3,7 +3,7 @@
 # Used for both the FastAPI server and the Celery worker (different CMD).
 # ─────────────────────────────────────────────────────────────────────────────
 
-FROM python:3.11-slim
+FROM python:3.11-slim-bullseye
 
 # System dependencies
 #   ffmpeg  — audio extraction / transcoding
