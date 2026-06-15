@@ -6,6 +6,9 @@ set -e
 
 PORT=${PORT:-8000}
 
+# Apply any pending Alembic migrations before starting the server.
+alembic upgrade head
+
 celery -A tasks.celery_app worker \
     --loglevel=info \
     --concurrency=2 \

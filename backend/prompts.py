@@ -49,7 +49,7 @@ Required fields:
 }}
 
 Rules:
-- meeting_type must be exactly one of the four values listed.
+- meeting_type must be exactly one of the values listed.
 - Only include content that is explicitly stated; never invent information.
 - If an action item's owner or due date is not stated, use "" and "TBD" respectively.
 - decisions, open_questions, and highlights may be empty arrays.
