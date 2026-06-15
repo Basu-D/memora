@@ -3,11 +3,11 @@
  *
  * Environment variables (set in .env or passed as Vite build args):
  *   VITE_API_BASE_URL  — backend origin, e.g. http://localhost:8000
- *   VITE_API_KEY       — value of ORG_API_KEY
  *
- * In development the Vite dev-server proxy forwards /upload, /status, /result,
- * /jobs to localhost:8000, so BASE_URL is effectively empty and API_KEY is
- * still sent via the X-API-Key header.
+ * Authentication: on module load, /api/session is called once to obtain a
+ * short-lived signed session token. The token is kept in memory (never
+ * compiled into the bundle) and injected into every subsequent request via
+ * the X-Session-Token header.
  */
 
 // In Docker, VITE_API_BASE_URL is "" and nginx proxies /api/* to the backend.
@@ -15,20 +15,59 @@
 // dev-server proxy forwards /api/* to http://localhost:8000.
 // All paths in this file therefore start with /api/.
 const BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? "").replace(/\/$/, "");
-const API_KEY  = import.meta.env.VITE_API_KEY ?? "";
 
 // Prefix for every backend route — must match the nginx location block.
 const API_ROOT = `${BASE_URL}/api`;
 
+// ---------------------------------------------------------------------------
+// Session management
+// ---------------------------------------------------------------------------
+
+let _sessionToken = null;
+let _sessionPromise = null;
+
 /**
- * Core fetch wrapper — injects auth header and throws a descriptive Error on
- * any non-2xx response.  `detail` from FastAPI JSON error bodies is surfaced.
+ * Fetch (or return the in-flight fetch of) a session token from the server.
+ * Invoked automatically before every API request.
+ */
+function _ensureSession() {
+  if (_sessionToken) return Promise.resolve(_sessionToken);
+  if (!_sessionPromise) {
+    _sessionPromise = fetch(`${API_ROOT}/session`)
+      .then((r) => r.json())
+      .then((data) => {
+        _sessionToken = data.token ?? null;
+        return _sessionToken;
+      })
+      .catch(() => {
+        _sessionPromise = null; // allow retry on next request
+        return null;
+      });
+  }
+  return _sessionPromise;
+}
+
+// Kick off the session fetch immediately so it's ready when the first
+// real API call arrives.
+_ensureSession();
+
+// ---------------------------------------------------------------------------
+// Core fetch wrapper
+// ---------------------------------------------------------------------------
+
+/**
+ * Core fetch wrapper — injects the session token and throws a descriptive
+ * Error on any non-2xx response. `detail` from FastAPI JSON error bodies
+ * is surfaced.
  */
 async function apiFetch(path, options = {}) {
+  const token = await _ensureSession();
+  const authHeader = token ? { "X-Session-Token": token } : {};
+
   const response = await fetch(`${API_ROOT}${path}`, {
     ...options,
     headers: {
-      "X-API-Key": API_KEY,
+      ...authHeader,
       ...options.headers,
     },
   });
@@ -80,12 +119,11 @@ export async function getConfluencePages(spaceKey) {
  * @param {string} customInstructions
  * @param {{space_key?:string, parent_page_id?:string, page_title?:string}} confluenceDest
  * @param {string} contextText
- * @param {string} contextReferenceUrl
  * @returns {Promise<{job_id: string, status: string}>}
  */
 export async function uploadMeeting(
   file, title = "", outputType = "detailed", publishToConfluence = true,
-  customInstructions = "", confluenceDest = {}, contextText = "", contextReferenceUrl = "",
+  customInstructions = "", confluenceDest = {}, contextText = "",
 ) {
   const formData = new FormData();
   formData.append("file", file);
@@ -97,7 +135,6 @@ export async function uploadMeeting(
   if (confluenceDest.parent_page_id)  formData.append("confluence_parent_page_id", confluenceDest.parent_page_id);
   if (confluenceDest.page_title)      formData.append("confluence_page_title", confluenceDest.page_title);
   if (contextText.trim())             formData.append("context_text", contextText.trim());
-  if (contextReferenceUrl.trim())     formData.append("confluence_reference_url", contextReferenceUrl.trim());
 
   const response = await apiFetch("/upload", {
     method: "POST",
@@ -122,12 +159,11 @@ export async function uploadMeeting(
  * @param {string} customInstructions
  * @param {{space_key?:string, parent_page_id?:string, page_title?:string}} confluenceDest
  * @param {string} contextText
- * @param {string} contextReferenceUrl
  * @returns {Promise<{job_id: string, status: string}>}
  */
 export async function submitUrlMeeting(
   url, title = "", outputType = "detailed", publishToConfluence = true,
-  customInstructions = "", confluenceDest = {}, contextText = "", contextReferenceUrl = "",
+  customInstructions = "", confluenceDest = {}, contextText = "",
 ) {
   const response = await apiFetch("/upload-url", {
     method: "POST",
@@ -142,7 +178,6 @@ export async function submitUrlMeeting(
       confluence_parent_page_id: confluenceDest.parent_page_id || "",
       confluence_page_title: confluenceDest.page_title || "",
       context_text: contextText.trim(),
-      confluence_reference_url: contextReferenceUrl.trim(),
     }),
   });
   return response.json();
@@ -203,18 +238,92 @@ export async function getJobResult(jobId) {
 }
 
 // ---------------------------------------------------------------------------
+// Publish retry
+// ---------------------------------------------------------------------------
+
+/**
+ * Re-queue Confluence publishing for a job that completed with publish_failed=true.
+ * Poll getJobStatus until status returns to "done", then call getJobResult for
+ * the updated result (which will have publish_failed=false on success).
+ *
+ * @param {string} jobId
+ * @returns {Promise<{job_id: string, status: string}>}
+ */
+export async function retryPublish(jobId) {
+  const response = await apiFetch(`/jobs/${jobId}/retry-publish`, { method: "POST" });
+  return response.json();
+}
+
+// ---------------------------------------------------------------------------
+// History
+// ---------------------------------------------------------------------------
+
+/**
+ * Fetch all processed jobs, newest first.
+ * Returns { jobs: [...], total: N }.
+ * Filtering is done client-side in HistoryView for instant feedback.
+ *
+ * @returns {Promise<{jobs: Array, total: number}>}
+ */
+export async function getHistory() {
+  const response = await apiFetch("/history");
+  return response.json();
+}
+
+// ---------------------------------------------------------------------------
 // Download
 // ---------------------------------------------------------------------------
 
 /**
  * Return the URL for downloading the .docx for a completed job.
- * The API key is included as a query param because this URL is used as an
- * anchor href — the browser navigates directly to it.
- *
- * TODO: replace with a short-lived signed URL or a session-cookie endpoint
- * to avoid exposing the API key in the URL / browser history.
+ * The session token is passed as a query param because this URL is used as
+ * an anchor href — the browser navigates directly to it without custom headers.
+ * The token is short-lived (24 h) and is never compiled into the JS bundle.
  */
 export function getDownloadUrl(jobId) {
-  const key = encodeURIComponent(API_KEY);
-  return `${API_ROOT}/jobs/${jobId}/download${key ? `?api_key=${key}` : ""}`;
+  const token = _sessionToken;
+  return `${API_ROOT}/jobs/${jobId}/download${token ? `?session_token=${encodeURIComponent(token)}` : ""}`;
+}
+
+// ---------------------------------------------------------------------------
+// User preferences
+// ---------------------------------------------------------------------------
+
+/**
+ * Fetch saved Confluence preferences for a user.
+ * Returns 404 if the user hasn't been seen by Memora yet — handle gracefully.
+ *
+ * @param {string} email
+ * @returns {Promise<{email, display_name, confluence_space_key, confluence_parent_page_id}>}
+ */
+export async function getUserPreferences(email) {
+  const response = await apiFetch(`/users/${encodeURIComponent(email)}/preferences`);
+  return response.json();
+}
+
+/**
+ * Save or update a user's Confluence preferences.
+ * Creates the user record on first call (upsert).
+ *
+ * @param {string} email
+ * @param {{ confluence_space_key: string, confluence_parent_page_id: string }} prefs
+ */
+export async function updateUserPreferences(email, prefs) {
+  const response = await apiFetch(`/users/${encodeURIComponent(email)}/preferences`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(prefs),
+  });
+  return response.json();
+}
+
+/**
+ * Fetch all jobs belonging to a user, newest first.
+ *
+ * @param {string} email
+ * @returns {Promise<{jobs: Array, total: number}>}
+ */
+export async function getUserJobs(email) {
+  const response = await apiFetch(`/users/${encodeURIComponent(email)}/jobs`);
+  return response.json();
 }

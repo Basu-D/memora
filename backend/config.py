@@ -45,6 +45,18 @@ class Settings(BaseSettings):
     mock_agent: bool = False           # skip Gemini API; return stub extraction + skip Confluence
 
 
+    # Webex integration
+    webex_bot_token: str = ""        # Bot token for downloading recordings via Webex API
+    webex_webhook_secret: str = ""   # If set, X-Spark-Signature HMAC-SHA1 is validated
+
+    # Email notifications (stdlib smtplib — no extra pip dependency)
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_user: str = ""
+    smtp_password: str = ""
+    smtp_from: str = "memora@yourdomain.com"
+    memora_base_url: str = "http://localhost:5173"
+
     # CORS — accepts JSON array ('["url1","url2"]') or comma-separated ("url1,url2").
     # Typed as str so pydantic-settings v2 never tries to JSON-parse it automatically.
     cors_origins_raw: str = Field(

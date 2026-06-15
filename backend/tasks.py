@@ -1,7 +1,8 @@
 """
 Celery task definitions for Memora.
-process_recording is the single entry point queued by the upload endpoint.
-It runs three sequential steps: audio extraction → Whisper transcription → agent.
+process_recording is the entry point for upload/URL-submit flows.
+process_webex_recording is the entry point for Webex webhook flows.
+Both converge on _run_pipeline() after the source file is on disk.
 """
 
 from __future__ import annotations
@@ -44,48 +45,34 @@ celery_app.conf.update(
 
 VIDEO_EXTENSIONS = {".mp4", ".webm"}
 
-OPENAI_AUDIO_SIZE_LIMIT = 24 * 1024 * 1024  # 24 MB (API limit is 25 MB)
+CHUNK_SIZE_LIMIT = 20 * 1024 * 1024   # trigger chunking above 20 MB (API limit is 25 MB)
+CHUNK_DURATION   = 600                  # seconds per chunk (10 minutes)
+CHUNK_OVERLAP    = 10                   # seconds of overlap to preserve boundary context
+
+WEBEX_API_BASE   = "https://webexapis.com/v1"
+WEBEX_MAX_BYTES  = 2 * 1024 * 1024 * 1024  # 2 GB download cap
 
 
 # ---------------------------------------------------------------------------
-# Public Celery task
+# Public Celery tasks
 # ---------------------------------------------------------------------------
 
 @celery_app.task(bind=True, name="tasks.process_recording")
 def process_recording(self, job_id: str) -> None:
     """
-    Orchestrate the full recording pipeline for one job.
+    Orchestrate the full recording pipeline for upload/URL-submit jobs.
 
-    Step 1 — Audio extraction (ffmpeg):
-        Convert upload to 16 kHz mono WAV.  Status → EXTRACTING_AUDIO.
-    Step 2 — Transcription (OpenAI Whisper API):
-        Transcribe WAV, write jobs/{job_id}/transcript.json.  Status → PROCESSING.
-    Step 3 — Agent (Gemini extraction + Confluence publish):
-        Call run_agent(job_id) from agent.py.  Status → PUBLISHING → DONE (set inside run_agent).
-
-    Each step is wrapped independently.  Any failure marks the job FAILED with a
-    descriptive error_message and returns early — there is no automatic retry,
-    since these are long-running CPU/network operations that are unlikely to
-    succeed on an immediate retry.
+    Step 0 (URL jobs only) — download source file.
+    Steps 1-3 — audio extraction → transcription → agent (via _run_pipeline).
     """
     from database import JobStatus, SessionLocal, get_job, update_job_status
 
-    # ------------------------------------------------------------------ setup
+    # ── Load routing info from DB ─────────────────────────────────────────────
     db = SessionLocal()
     try:
-        job = get_job(db, job_id)           # raises ValueError if missing
+        job = get_job(db, job_id)
         storage_path = job.storage_path
-        source_url = job.source_url
-        output_type = job.output_type or "detailed"
-        publish_to_confluence = job.publish_to_confluence if job.publish_to_confluence is not None else True
-        custom_instructions = job.custom_instructions or ""
-        confluence_destination = {
-            "space_key":      job.confluence_space_key or "",
-            "parent_page_id": job.confluence_parent_page_id or "",
-            "page_title":     job.confluence_page_title or "",
-        }
-        context_text = job.context_text or ""
-        # screenshots_enabled = job.screenshots_enabled  # §4.4 TODO
+        source_url   = job.source_url
     except ValueError as exc:
         logger.error("process_recording: job %s not found — %s", job_id, exc)
         db.close()
@@ -98,7 +85,7 @@ def process_recording(self, job_id: str) -> None:
     finally:
         db.close()
 
-    # ------------------------------------------------- Step 0: URL download
+    # ── Step 0: URL download ─────────────────────────────────────────────────
     if not storage_path and source_url:
         db = SessionLocal()
         try:
@@ -107,7 +94,7 @@ def process_recording(self, job_id: str) -> None:
             db.close()
 
         try:
-            downloader = get_downloader()
+            downloader  = get_downloader()
             upload_path = downloader.download(source_url, job_id, Path(settings.upload_dir))
             storage_path = upload_path.name
             logger.info("[%s] Download complete: %s", job_id, upload_path)
@@ -116,11 +103,10 @@ def process_recording(self, job_id: str) -> None:
             _mark_failed_new_session(job_id, f"Download failed: {exc}")
             return
 
-        # Persist the storage_path so the rest of the pipeline can find the file.
+        # Persist the storage_path so the pipeline can find the file.
         db = SessionLocal()
         try:
-            from database import get_job as _get_job
-            j = _get_job(db, job_id)
+            j = get_job(db, job_id)
             j.storage_path = storage_path
             db.commit()
         finally:
@@ -135,10 +121,91 @@ def process_recording(self, job_id: str) -> None:
         _mark_failed_new_session(job_id, f"Upload file not found: {upload_path}")
         return
 
+    _run_pipeline(job_id, upload_path)
+
+
+@celery_app.task(bind=True, name="tasks.process_webex_recording")
+def process_webex_recording(self, job_id: str, recording_id: str) -> None:
+    """
+    Download a Webex cloud recording via the Webex API and run the pipeline.
+
+    Triggered by POST /webhooks/webex.  Separate from process_recording so the
+    webhook handler can return 200 immediately without waiting for the download.
+    """
+    from database import JobStatus, SessionLocal, get_job, update_job_status
+
+    # ── Step 0: Download from Webex ──────────────────────────────────────────
+    db = SessionLocal()
+    try:
+        update_job_status(db, job_id, JobStatus.DOWNLOADING)
+    finally:
+        db.close()
+
+    try:
+        storage_filename = _download_webex_recording(job_id, recording_id)
+    except Exception as exc:
+        logger.exception("[%s] Webex download failed (recording=%s)", job_id, recording_id)
+        _mark_failed_new_session(job_id, f"Webex download failed: {exc}")
+        return
+
+    # Persist storage_path so history / retries can find the file.
+    db = SessionLocal()
+    try:
+        j = get_job(db, job_id)
+        j.storage_path = storage_filename
+        db.commit()
+    except Exception as exc:
+        logger.exception("[%s] Failed to persist storage_path after Webex download", job_id)
+        _mark_failed_new_session(job_id, f"Failed to save download path: {exc}")
+        return
+    finally:
+        db.close()
+
+    upload_path = Path(settings.upload_dir) / storage_filename
+    _run_pipeline(job_id, upload_path)
+
+
+# ---------------------------------------------------------------------------
+# Shared pipeline — steps 1-3 for any job with a file already on disk
+# ---------------------------------------------------------------------------
+
+def _run_pipeline(job_id: str, upload_path: Path) -> None:
+    """
+    Run audio extraction → transcription → agent for a job whose source file
+    is already saved at upload_path.
+
+    Called by both process_recording and process_webex_recording.
+    Reads agent config (output_type, confluence_destination, …) fresh from DB.
+    """
+    from database import JobStatus, SessionLocal, get_job, update_job_status
+
+    # Read agent config — done here so callers don't need to pass it through.
+    db = SessionLocal()
+    try:
+        job = get_job(db, job_id)
+        output_type           = job.output_type or "detailed"
+        publish_to_confluence = job.publish_to_confluence if job.publish_to_confluence is not None else True
+        custom_instructions   = job.custom_instructions or ""
+        confluence_destination = {
+            "space_key":      job.confluence_space_key or "",
+            "parent_page_id": job.confluence_parent_page_id or "",
+            "page_title":     job.confluence_page_title or "",
+        }
+        context_text = job.context_text or ""
+    except ValueError as exc:
+        logger.error("[%s] _run_pipeline: job not found — %s", job_id, exc)
+        return
+    except Exception:
+        logger.exception("[%s] _run_pipeline: error loading job config", job_id)
+        _mark_failed_new_session(job_id, "Failed to load job config.")
+        return
+    finally:
+        db.close()
+
     job_dir = Path(settings.jobs_dir) / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
 
-    # ---------------------------------------------------------- Step 1: audio
+    # ── Step 1: Audio extraction ─────────────────────────────────────────────
     db = SessionLocal()
     try:
         update_job_status(db, job_id, JobStatus.EXTRACTING_AUDIO)
@@ -153,7 +220,7 @@ def process_recording(self, job_id: str) -> None:
         _mark_failed_new_session(job_id, f"Audio extraction failed: {exc}")
         return
 
-    # ------------------------------------------------------- Step 2: transcribe
+    # ── Step 2: Transcription ────────────────────────────────────────────────
     db = SessionLocal()
     try:
         update_job_status(db, job_id, JobStatus.TRANSCRIBING)
@@ -174,12 +241,7 @@ def process_recording(self, job_id: str) -> None:
     finally:
         db.close()
 
-    # Step 3b: Screenshot capture (screenshots_enabled) — §4.4 TODO
-    # if screenshots_enabled:
-    #     from screenshot_capture import capture_screenshots
-    #     capture_screenshots(job_id, upload_path, job_dir, transcript_data)
-
-    # --------------------------------------------------------- Step 3: agent
+    # ── Step 3: Agent ────────────────────────────────────────────────────────
     try:
         from agent import run_agent
         run_agent(
@@ -195,6 +257,83 @@ def process_recording(self, job_id: str) -> None:
         logger.exception("[%s] Agent/publish step failed", job_id)
         _mark_failed_new_session(job_id, f"Agent processing failed: {exc}")
         return
+
+    # ── Email notification (non-fatal) ───────────────────────────────────────
+    _try_send_completion_email(job_id)
+
+
+# ---------------------------------------------------------------------------
+# Webex download helper
+# ---------------------------------------------------------------------------
+
+def _download_webex_recording(job_id: str, recording_id: str) -> str:
+    """
+    Fetch recording metadata from the Webex API and stream the file to
+    upload_dir.  Returns the storage filename (basename only, e.g.
+    "{job_id}.mp4") so the caller can persist it to the DB.
+
+    Auth priority for the actual file download:
+      1. temporaryDirectDownloadLinks.audioVideoDownloadLink — pre-signed,
+         no Authorization header needed (preferred).
+      2. temporaryDirectDownloadLinks.audioDownloadLink — audio-only fallback.
+      3. downloadUrl — requires the bearer token.
+    """
+    import httpx
+
+    bot_token = settings.webex_bot_token
+    if not bot_token:
+        raise RuntimeError("WEBEX_BOT_TOKEN is not configured.")
+
+    auth_headers = {"Authorization": f"Bearer {bot_token}"}
+
+    # 1. Get recording metadata.
+    with httpx.Client(timeout=30) as client:
+        r = client.get(f"{WEBEX_API_BASE}/recordings/{recording_id}", headers=auth_headers)
+        if r.status_code == 404:
+            raise RuntimeError(f"Recording {recording_id!r} not found on Webex.")
+        r.raise_for_status()
+        details = r.json()
+
+    # 2. Pick the best download URL.
+    direct = details.get("temporaryDirectDownloadLinks") or {}
+    pre_signed_url = direct.get("audioVideoDownloadLink") or direct.get("audioDownloadLink")
+    fallback_url   = details.get("downloadUrl")
+
+    if pre_signed_url:
+        download_url     = pre_signed_url
+        download_headers = {}          # pre-signed URLs carry auth in query params
+    elif fallback_url:
+        download_url     = fallback_url
+        download_headers = auth_headers
+    else:
+        raise RuntimeError(f"No download URL in Webex recording metadata for {recording_id!r}.")
+
+    # 3. Stream the file to disk, choosing extension from Content-Type.
+    dest_path = Path(settings.upload_dir) / f"{job_id}.mp4"   # default
+
+    written = 0
+    with httpx.Client(timeout=httpx.Timeout(connect=10.0, read=600.0, write=10.0, pool=10.0)) as client:
+        with client.stream("GET", download_url, headers=download_headers, follow_redirects=True) as r:
+            r.raise_for_status()
+            ct = r.headers.get("content-type", "")
+            if "audio/mpeg" in ct or "mp3" in ct:
+                dest_path = Path(settings.upload_dir) / f"{job_id}.mp3"
+            elif "audio/mp4" in ct or "m4a" in ct:
+                dest_path = Path(settings.upload_dir) / f"{job_id}.m4a"
+            elif "webm" in ct:
+                dest_path = Path(settings.upload_dir) / f"{job_id}.webm"
+
+            with dest_path.open("wb") as fh:
+                for chunk in r.iter_bytes(chunk_size=256 * 1024):
+                    written += len(chunk)
+                    if written > WEBEX_MAX_BYTES:
+                        dest_path.unlink(missing_ok=True)
+                        raise RuntimeError("Recording exceeds the 2 GB download limit.")
+                    fh.write(chunk)
+
+    size_mb = dest_path.stat().st_size / 1024 / 1024
+    logger.info("[%s] Webex download complete: %s (%.1f MB)", job_id, dest_path.name, size_mb)
+    return dest_path.name
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +388,124 @@ def _extract_audio(source: Path, job_dir: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
+# Chunking helpers — used by _transcribe when the file exceeds CHUNK_SIZE_LIMIT
+# ---------------------------------------------------------------------------
+
+def _get_audio_duration(audio_path: Path) -> float:
+    """Return duration in seconds via ffprobe."""
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(audio_path),
+        ],
+        capture_output=True, text=True, timeout=30,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"ffprobe failed: {result.stderr.strip()}")
+    return float(result.stdout.strip())
+
+
+def _split_into_chunks(audio_path: Path, job_dir: Path, job_id: str) -> list[tuple[Path, float]]:
+    """
+    Split *audio_path* into overlapping 10-minute MP3 chunks.
+
+    Each chunk is CHUNK_DURATION seconds long with a CHUNK_OVERLAP-second tail
+    (so the next chunk's Whisper call has a few seconds of context from the
+    boundary).  The overlap region is stripped during stitching.
+
+    Returns:
+        List of (chunk_path, chunk_start_seconds) tuples in order.
+    """
+    chunks_dir = job_dir / "chunks"
+    chunks_dir.mkdir(exist_ok=True)
+
+    duration = _get_audio_duration(audio_path)
+    logger.info("[%s] Audio duration: %.1f s — splitting into %.0f-s chunks", job_id, duration, CHUNK_DURATION)
+
+    chunks: list[tuple[Path, float]] = []
+    chunk_index = 0
+    start = 0.0
+
+    while start < duration:
+        chunk_path = chunks_dir / f"chunk_{chunk_index:03d}.mp3"
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", str(start),          # input-side seek (fast, sub-second accuracy)
+            "-i", str(audio_path),
+            "-t", str(CHUNK_DURATION + CHUNK_OVERLAP),
+            "-acodec", "copy",
+            str(chunk_path),
+        ]
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"ffmpeg chunk {chunk_index} failed (rc={result.returncode}): "
+                f"{result.stderr[-400:].strip()}"
+            )
+
+        size_mb = chunk_path.stat().st_size / 1024 / 1024
+        logger.info("[%s] Chunk %d: start=%.1fs size=%.1fMB", job_id, chunk_index, start, size_mb)
+
+        chunks.append((chunk_path, start))
+        start += CHUNK_DURATION
+        chunk_index += 1
+
+    return chunks
+
+
+def _transcribe_chunked(audio_path: Path, job_dir: Path, job_id: str, client) -> dict:
+    """
+    Transcribe a large audio file by splitting it into chunks and stitching
+    the results.
+
+    For each chunk after the first, the leading CHUNK_OVERLAP seconds of
+    segments are discarded (they overlap with the tail of the previous chunk).
+    Segment timestamps are adjusted to absolute positions in the original file.
+    """
+    chunks = _split_into_chunks(audio_path, job_dir, job_id)
+
+    all_segments: list[dict] = []
+    language = "unknown"
+
+    for i, (chunk_path, chunk_start) in enumerate(chunks):
+        logger.info("[%s] Whisper chunk %d/%d (offset=%.1fs)", job_id, i + 1, len(chunks), chunk_start)
+
+        with chunk_path.open("rb") as f:
+            response = client.audio.transcriptions.create(
+                model="whisper-1",
+                file=f,
+                response_format="verbose_json",
+                timestamp_granularities=["segment"],
+            )
+
+        if response.language and language == "unknown":
+            language = response.language
+
+        # Drop the overlap region from every chunk except the first so we don't
+        # double-count the audio that appears at the end of the previous chunk.
+        overlap_cutoff = CHUNK_OVERLAP if i > 0 else 0.0
+
+        for seg in (response.segments or []):
+            if seg.start < overlap_cutoff:
+                continue
+            all_segments.append({
+                "start": round(chunk_start + seg.start, 3),
+                "end":   round(chunk_start + seg.end,   3),
+                "text":  seg.text.strip(),
+            })
+
+    full_text = " ".join(s["text"] for s in all_segments)
+    logger.info("[%s] Chunked transcript: %d chars across %d segments from %d chunk(s)",
+                job_id, len(full_text), len(all_segments), len(chunks))
+
+    return {"full_text": full_text, "segments": all_segments, "language": language}
+
+
+# ---------------------------------------------------------------------------
 # Step 2 helper — OpenAI Whisper API transcription
 # ---------------------------------------------------------------------------
 
@@ -266,8 +523,10 @@ def _transcribe(audio_path: Path, job_dir: Path, job_id: str) -> Path:
             "language":   "en"
         }
 
+    Files over CHUNK_SIZE_LIMIT are automatically split into 10-minute chunks,
+    transcribed separately, and stitched before writing.
+
     Raises:
-        RuntimeError: If the audio exceeds the 25 MB API limit.
         openai.APIError: On API-level failures (propagates to the task).
     """
     if settings.mock_transcription:
@@ -302,40 +561,37 @@ def _transcribe(audio_path: Path, job_dir: Path, job_id: str) -> Path:
 
     from openai import OpenAI
 
-    file_size = audio_path.stat().st_size
-    if file_size > OPENAI_AUDIO_SIZE_LIMIT:
-        size_mb = file_size / 1024 / 1024
-        raise RuntimeError(
-            f"Audio file is {size_mb:.0f} MB — OpenAI Whisper API limit is 25 MB. "
-            "This recording is too long (approx. >50 minutes). "
-            "Please split it into shorter segments and resubmit."
-        )
-
     client = OpenAI(api_key=settings.openai_api_key)
+    file_size = audio_path.stat().st_size
+    size_mb = file_size / 1024 / 1024
 
-    logger.info("[%s] OpenAI Whisper API transcribing %s (%.1f MB)",
-                job_id, audio_path.name, file_size / 1024 / 1024)
+    if file_size > CHUNK_SIZE_LIMIT:
+        logger.info("[%s] Audio is %.1f MB — using chunked transcription", job_id, size_mb)
+        transcript = _transcribe_chunked(audio_path, job_dir, job_id, client)
+    else:
+        logger.info("[%s] OpenAI Whisper API transcribing %s (%.1f MB)",
+                    job_id, audio_path.name, size_mb)
 
-    with audio_path.open("rb") as f:
-        response = client.audio.transcriptions.create(
-            model="whisper-1",
-            file=f,
-            response_format="verbose_json",
-            timestamp_granularities=["segment"],
-        )
+        with audio_path.open("rb") as f:
+            response = client.audio.transcriptions.create(
+                model="whisper-1",
+                file=f,
+                response_format="verbose_json",
+                timestamp_granularities=["segment"],
+            )
 
-    transcript = {
-        "full_text": response.text.strip(),
-        "segments": [
-            {
-                "start": round(seg.start, 3),
-                "end":   round(seg.end, 3),
-                "text":  seg.text.strip(),
-            }
-            for seg in (response.segments or [])
-        ],
-        "language": response.language or "unknown",
-    }
+        transcript = {
+            "full_text": response.text.strip(),
+            "segments": [
+                {
+                    "start": round(seg.start, 3),
+                    "end":   round(seg.end, 3),
+                    "text":  seg.text.strip(),
+                }
+                for seg in (response.segments or [])
+            ],
+            "language": response.language or "unknown",
+        }
 
     transcript_path = job_dir / "transcript.json"
     transcript_path.write_text(
@@ -351,6 +607,116 @@ def _transcribe(audio_path: Path, job_dir: Path, job_id: str) -> Path:
         transcript["language"],
     )
     return transcript_path
+
+
+# ---------------------------------------------------------------------------
+# Retry publish task
+# ---------------------------------------------------------------------------
+
+@celery_app.task(bind=True, name="tasks.retry_confluence_publish")
+def retry_confluence_publish(self, job_id: str) -> None:
+    """
+    Re-attempt Confluence publishing for a DONE job with publish_failed=True.
+
+    On success: clears publish_failed and sets confluence_url.
+    On failure: restores publish_failed=True so the user can retry again.
+    """
+    from database import JobStatus, SessionLocal, get_job, update_job_status
+
+    db = SessionLocal()
+    try:
+        job = get_job(db, job_id)
+        result_json_str        = job.result_json
+        confluence_space_key   = job.confluence_space_key or ""
+        confluence_parent_id   = job.confluence_parent_page_id or ""
+    except Exception as exc:
+        logger.error("[%s] retry_confluence_publish: failed to load job: %s", job_id, exc)
+        return
+    finally:
+        db.close()
+
+    if not result_json_str:
+        logger.error("[%s] retry_confluence_publish: no result_json to publish", job_id)
+        return
+
+    try:
+        result = json.loads(result_json_str)
+    except json.JSONDecodeError:
+        logger.error("[%s] retry_confluence_publish: corrupt result_json", job_id)
+        return
+
+    try:
+        from agent import retry_publish
+        pub = retry_publish(job_id, result, confluence_space_key, confluence_parent_id)
+
+        result["confluence_url"] = pub["confluence_url"]
+        result["page_action"]    = pub["page_action"]
+        updated_json = json.dumps(result, ensure_ascii=False)
+
+        db = SessionLocal()
+        try:
+            update_job_status(
+                db, job_id, JobStatus.DONE,
+                confluence_url=pub["confluence_url"],
+                result_json=updated_json,
+                publish_failed=False,
+            )
+        finally:
+            db.close()
+
+        logger.info("[%s] Retry publish succeeded: %s", job_id, pub["confluence_url"])
+        _try_send_completion_email(job_id)
+
+    except Exception as exc:
+        logger.exception("[%s] Retry publish failed", job_id)
+        db = SessionLocal()
+        try:
+            update_job_status(db, job_id, JobStatus.DONE, publish_failed=True)
+        finally:
+            db.close()
+
+
+# ---------------------------------------------------------------------------
+# Email notification helper
+# ---------------------------------------------------------------------------
+
+def _try_send_completion_email(job_id: str) -> None:
+    """
+    Send a job-completion email if the job came from a Webex webhook and
+    SMTP is configured.  Conditions for sending (all must be true):
+      - job.host_email is set (webhook-originated job, not a manual upload)
+      - job.confluence_url is set (Confluence publish succeeded)
+      - job.user_id resolves to a User with a non-empty email
+
+    Never raises — email failure must not alter the job's final status.
+    """
+    try:
+        from database import SessionLocal, User
+        from database import get_job as _get_job
+        from notifications import send_job_complete_email
+
+        db = SessionLocal()
+        try:
+            job = _get_job(db, job_id)
+
+            if not job.host_email:
+                return   # manual upload — no host to notify
+            if not job.confluence_url:
+                return   # publish_failed path — no page to link to
+
+            user: User | None = None
+            if job.user_id:
+                user = db.query(User).filter(User.id == job.user_id).first()
+            if user is None or not user.email:
+                return
+
+            send_job_complete_email(job, user, job.confluence_url)
+            logger.info("[%s] Completion email sent to %s", job_id, user.email)
+        finally:
+            db.close()
+
+    except Exception:
+        logger.warning("[%s] Email notification failed (non-fatal)", job_id, exc_info=True)
 
 
 # ---------------------------------------------------------------------------

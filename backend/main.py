@@ -4,6 +4,8 @@ FastAPI application — upload endpoint, job status, and result retrieval.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import io
 import json
 import logging
@@ -22,7 +24,11 @@ from sqlalchemy.orm import Session
 from auth import APIKeyMiddleware
 from config import settings
 from confluence import ConfluenceClient
-from database import JobStatus, create_job, get_db, get_job, init_db, update_job_status
+from database import (
+    JobStatus, create_job, get_db, get_job, init_db, list_jobs, update_job_status,
+    get_or_create_user_by_email, get_user_by_email, get_user_by_webex_host_id,
+    update_user_preferences, list_jobs_by_user,
+)
 from tasks import process_recording
 
 logging.basicConfig(level=logging.INFO)
@@ -82,6 +88,24 @@ async def on_startup() -> None:
 async def health() -> dict:
     """Liveness probe."""
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Session
+# ---------------------------------------------------------------------------
+
+@app.get("/session", tags=["auth"])
+async def create_session() -> JSONResponse:
+    """
+    Issue a short-lived signed session token for browser clients.
+
+    The token is HMAC-signed with ORG_API_KEY and expires after 24 hours.
+    The frontend calls this once on load and includes the token via the
+    X-Session-Token header — the actual ORG_API_KEY never reaches the browser.
+    """
+    from auth import _sign_session
+    token = _sign_session(settings.org_api_key)
+    return JSONResponse(content={"token": token})
 
 
 # ---------------------------------------------------------------------------
@@ -308,14 +332,79 @@ async def job_status(job_id: str, db: Session = Depends(get_db)) -> JSONResponse
     except ValueError:
         raise HTTPException(status_code=404, detail="Job not found.")
 
+    agent_decisions: list = []
+    if job.result_json:
+        try:
+            agent_decisions = json.loads(job.result_json).get("agent_decisions") or []
+        except json.JSONDecodeError:
+            pass
+
     return JSONResponse(content={
-        "job_id": job.id,
-        "status": job.status.value,
-        "filename": job.filename,
-        "created_at": job.created_at.isoformat() if job.created_at else None,
-        "updated_at": job.updated_at.isoformat() if job.updated_at else None,
-        "error_message": job.error_message,
+        "job_id":          job.id,
+        "status":          job.status.value,
+        "filename":        job.filename,
+        "created_at":      job.created_at.isoformat() if job.created_at else None,
+        "updated_at":      job.updated_at.isoformat() if job.updated_at else None,
+        "error_message":   job.error_message,
+        "agent_decisions": agent_decisions,
     })
+
+
+# ---------------------------------------------------------------------------
+# GET /history
+# ---------------------------------------------------------------------------
+
+@app.get("/history", tags=["jobs"])
+async def job_history(
+    search: str | None = None,
+    db: Session = Depends(get_db),
+) -> JSONResponse:
+    """
+    Return all jobs ordered by newest-first.
+
+    Each item includes meeting_type and a 100-character summary snippet
+    extracted from result_json.  The optional ?search= parameter filters
+    case-insensitively against the job title (extracted title or filename)
+    and the meeting type.
+    """
+    jobs = list_jobs(db)
+
+    search_term = search.strip().lower() if search and search.strip() else None
+
+    items = []
+    for job in jobs:
+        result: dict = {}
+        if job.result_json:
+            try:
+                result = json.loads(job.result_json)
+            except json.JSONDecodeError:
+                pass
+
+        meeting_type     = result.get("meeting_type") or ""
+        extracted_title  = result.get("title") or ""
+        summary          = result.get("summary") or ""
+
+        # Prefer the AI-extracted title; fall back to the uploaded filename.
+        display_title = extracted_title or job.filename
+
+        if search_term:
+            haystack = f"{display_title} {meeting_type}".lower()
+            if search_term not in haystack:
+                continue
+
+        items.append({
+            "job_id":          job.id,
+            "title":           display_title,
+            "filename":        job.filename,
+            "meeting_type":    meeting_type or None,
+            "status":          job.status.value,
+            "created_at":      job.created_at.isoformat() if job.created_at else None,
+            "confluence_url":  job.confluence_url,
+            "summary_snippet": summary[:100] or None,
+            "publish_failed":  bool(job.publish_failed),
+        })
+
+    return JSONResponse(content={"jobs": items, "total": len(items)})
 
 
 # ---------------------------------------------------------------------------
@@ -367,11 +456,50 @@ async def job_result(job_id: str, db: Session = Depends(get_db)) -> JSONResponse
         result_data = None
 
     return JSONResponse(content={
-        "job_id": job.id,
-        "status": job.status.value,
+        "job_id":         job.id,
+        "status":         job.status.value,
         "confluence_url": job.confluence_url,
-        "result": result_data,
+        "result":         result_data,
+        "publish_failed": bool(job.publish_failed),
     })
+
+
+# ---------------------------------------------------------------------------
+# POST /jobs/{job_id}/retry-publish
+# ---------------------------------------------------------------------------
+
+@app.post("/jobs/{job_id}/retry-publish", status_code=status.HTTP_202_ACCEPTED, tags=["jobs"])
+async def retry_publish_endpoint(job_id: str, db: Session = Depends(get_db)) -> JSONResponse:
+    """
+    Re-queue Confluence publishing for a completed job where publish_failed=True.
+
+    Sets status → PUBLISHING and clears publish_failed before queuing the task,
+    so a second click while the retry is in-flight returns 409 instead of
+    creating a duplicate task.
+    """
+    try:
+        job = get_job(db, job_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Job not found.")
+
+    if job.status == JobStatus.PUBLISHING:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Publish already in progress.")
+
+    if job.status != JobStatus.DONE:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Can only retry a completed job.")
+
+    if not job.publish_failed:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Confluence publish did not fail for this job.")
+
+    update_job_status(db, job_id, JobStatus.PUBLISHING, publish_failed=False)
+
+    from tasks import retry_confluence_publish
+    retry_confluence_publish.delay(job_id)
+
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED,
+        content={"job_id": job_id, "status": "retrying"},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -420,6 +548,198 @@ async def download_job_docx(
         io.BytesIO(docx_bytes),
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+# ---------------------------------------------------------------------------
+# User preferences + per-user job list
+# ---------------------------------------------------------------------------
+
+class UserPreferencesUpdate(BaseModel):
+    confluence_space_key: str = ""
+    confluence_parent_page_id: str = ""
+
+
+@app.get("/users/{email}/preferences", tags=["users"])
+async def get_user_preferences(email: str, db: Session = Depends(get_db)) -> JSONResponse:
+    """
+    Return the Confluence preferences saved for a user.
+
+    Response: { email, display_name, confluence_space_key, confluence_parent_page_id }
+    Returns 404 if the user has never been seen by Memora.
+    """
+    user = get_user_by_email(db, email)
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found.")
+    return JSONResponse(content={
+        "email":                     user.email,
+        "display_name":              user.display_name,
+        "confluence_space_key":      user.confluence_space_key,
+        "confluence_parent_page_id": user.confluence_parent_page_id,
+    })
+
+
+@app.put("/users/{email}/preferences", tags=["users"])
+async def put_user_preferences(
+    email: str,
+    body: UserPreferencesUpdate,
+    db: Session = Depends(get_db),
+) -> JSONResponse:
+    """
+    Save or update a user's preferred Confluence destination.
+
+    Creates the user record if it doesn't exist yet (idempotent first-time setup).
+    Returns the full updated user object.
+    """
+    user = get_or_create_user_by_email(db, email)
+    user = update_user_preferences(
+        db,
+        user.id,
+        space_key=body.confluence_space_key.strip() or None,
+        parent_page_id=body.confluence_parent_page_id.strip() or None,
+    )
+    return JSONResponse(content={
+        "email":                     user.email,
+        "display_name":              user.display_name,
+        "confluence_space_key":      user.confluence_space_key,
+        "confluence_parent_page_id": user.confluence_parent_page_id,
+        "updated_at":                user.updated_at.isoformat() if user.updated_at else None,
+    })
+
+
+@app.get("/users/{email}/jobs", tags=["users"])
+async def get_user_jobs(email: str, db: Session = Depends(get_db)) -> JSONResponse:
+    """
+    Return all jobs belonging to a user, ordered by newest-first.
+
+    Powers the per-user dashboard/filtered view.
+    Returns 404 if the user does not exist.
+    """
+    user = get_user_by_email(db, email)
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    jobs = list_jobs_by_user(db, user.id)
+
+    items = []
+    for job in jobs:
+        result: dict = {}
+        if job.result_json:
+            try:
+                result = json.loads(job.result_json)
+            except json.JSONDecodeError:
+                pass
+        meeting_title = result.get("title") or job.filename
+        items.append({
+            "id":            job.id,
+            "status":        job.status.value,
+            "meeting_title": meeting_title,
+            "confluence_url": job.confluence_url,
+            "created_at":    job.created_at.isoformat() if job.created_at else None,
+            "host_email":    job.host_email,
+        })
+
+    return JSONResponse(content={"jobs": items, "total": len(items)})
+
+
+# ---------------------------------------------------------------------------
+# POST /webhooks/webex
+# ---------------------------------------------------------------------------
+
+def _verify_webex_signature(raw_body: bytes, header: str, secret: str) -> bool:
+    """Return True when X-Spark-Signature matches HMAC-SHA1 of raw_body."""
+    expected = hmac.new(secret.encode(), raw_body, hashlib.sha1).hexdigest()
+    return hmac.compare_digest(expected, header)
+
+
+@app.post("/webhooks/webex", tags=["webhooks"])
+async def webex_webhook(request: Request, db: Session = Depends(get_db)) -> JSONResponse:
+    """
+    Receive Webex recording.ready webhook events (resource=recordings, event=created).
+
+    Flow:
+      1. Validate X-Spark-Signature (HMAC-SHA1) if WEBEX_WEBHOOK_SECRET is set.
+      2. Ignore events we don't handle (resource/event mismatch) with a 200.
+      3. Resolve or create the host User via webex_host_id → email fallback.
+      4. Create a Job record with user_id and host_email.
+      5. Queue process_webex_recording (downloads + pipeline runs in Celery).
+      6. Return 200 immediately — Webex retries on non-2xx responses.
+    """
+    raw_body = await request.body()
+
+    # ── Signature validation ─────────────────────────────────────────────────
+    if settings.webex_webhook_secret:
+        signature = request.headers.get("X-Spark-Signature", "")
+        if not _verify_webex_signature(raw_body, signature, settings.webex_webhook_secret):
+            logger.warning("Webex webhook: invalid X-Spark-Signature — rejected")
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
+                                detail="Invalid webhook signature.")
+
+    # ── Parse payload ────────────────────────────────────────────────────────
+    try:
+        payload = json.loads(raw_body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="Invalid JSON payload.")
+
+    # ── Filter to recording.ready events only ────────────────────────────────
+    if payload.get("resource") != "recordings" or payload.get("event") != "created":
+        # Return 200 so Webex doesn't retry — we just don't process it.
+        return JSONResponse(content={"detail": "event ignored"})
+
+    # ── Extract fields ───────────────────────────────────────────────────────
+    data             = payload.get("data") or {}
+    host_email       = (data.get("hostEmail") or "").strip()
+    host_display_name = (data.get("hostDisplayName") or "").strip() or None
+    recording_id     = (data.get("recordingId") or "").strip()
+    actor_id         = (payload.get("actorId") or "").strip()   # Webex host's person ID
+
+    if not recording_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="Missing recordingId in webhook payload.")
+    if not host_email:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="Missing hostEmail in webhook payload.")
+
+    # ── Resolve user ─────────────────────────────────────────────────────────
+    # Try the stable Webex host ID first; fall back to email lookup / creation.
+    user = get_user_by_webex_host_id(db, actor_id) if actor_id else None
+
+    if user is None:
+        user = get_or_create_user_by_email(db, host_email)
+
+    # Back-fill any missing fields on the user record.
+    needs_commit = False
+    if actor_id and not user.webex_host_id:
+        user.webex_host_id = actor_id
+        needs_commit = True
+    if host_display_name and not user.display_name:
+        user.display_name = host_display_name
+        needs_commit = True
+    if needs_commit:
+        db.commit()
+        db.refresh(user)
+
+    # ── Create job ───────────────────────────────────────────────────────────
+    job = create_job(
+        db,
+        filename=f"{recording_id}.mp4",
+        user_id=user.id,
+        host_email=host_email,
+    )
+
+    # ── Queue Celery task ────────────────────────────────────────────────────
+    from tasks import process_webex_recording
+    process_webex_recording.delay(job.id, recording_id)
+
+    logger.info(
+        "Webex webhook: recording_id=%s → job=%s (user=%s actor=%s)",
+        recording_id, job.id, user.email, actor_id or "unknown",
+    )
+
+    return JSONResponse(
+        status_code=status.HTTP_200_OK,
+        content={"job_id": job.id, "status": job.status.value},
     )
 
 
